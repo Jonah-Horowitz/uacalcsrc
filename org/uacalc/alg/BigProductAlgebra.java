@@ -637,6 +637,24 @@ System.out.println("so far: " + currentMark);
     return lst;
   }
 
+  public List<IntArray> sgCloseParallel(List<IntArray> elems, final Map<IntArray,Term> termMap, final IntArray elt, ProgressReport report, int numThreads, int indicesPerChunk, String partialSave) {
+	  return sgCloseParallel(elems, 0, termMap, elt, report, numThreads, indicesPerChunk, partialSave);
+  }
+  
+  /**
+   * A parallel version of <code>sgClose</code>
+   * @param numThreads the number of threads to use (0=number of available cores)
+   * @param indicesPerChunk - the number of indices to be placed in each calculation chunk
+   */
+  public List<IntArray> sgCloseParallel(List<IntArray> elems, int closedMark, final Map<IntArray,Term> termMap, final IntArray elt, ProgressReport report, int numThreads, int indicesPerChunk, String partialSave) {
+	  final ArrayList<IntArray> elemsCopy = new ArrayList<IntArray>(elems);
+	  Closer closer = new Closer(this, elemsCopy, termMap);
+	  closer.setProgressReport(report);
+	  closer.setElementToFind(elt);
+	  closer.writeTermMapOnComplete=partialSave;
+	  return closer.sgCloseParallel(numThreads,indicesPerChunk);
+  }
+  
   /**
    * Closure of <code>elems</code> under the operations.
    * Computes the closure of the specified tuples (in the collection <code>elems</code>) under all
@@ -678,6 +696,7 @@ System.out.println("so far: " + currentMark);
     */
     //----- start closure -----
     Closer closer = new Closer(this, elemsCopy, termMap);
+    if ( report==null ) closer.setSuppressOutput(true);    	
     closer.setProgressReport(report);
     closer.setElementToFind(elt);
     

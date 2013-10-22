@@ -9,13 +9,20 @@ import org.uacalc.ui.tm.ProgressReport;
 import org.uacalc.util.*;
 import org.uacalc.terms.*;
 import org.uacalc.eq.*;
-
+import org.uacalc.io.TermMapWriter;
 import org.uacalc.alg.conlat.*;
 import org.uacalc.alg.op.AbstractOperation;
 import org.uacalc.alg.op.Operation;
 import org.uacalc.alg.op.OperationWithDefaultValue;
 import org.uacalc.alg.op.OperationSymbol;
 import org.uacalc.alg.op.Operations;
+
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+
+import org.uacalc.util.SequenceIterator;
+import java.io.FileNotFoundException;
+
 
 /**
  * A class for finding the closure with configurations for several options
@@ -28,6 +35,9 @@ import org.uacalc.alg.op.Operations;
  *
  */
 public class Closer {
+	
+	public static final int FEEDER_CAPACITY = 10000; // The capacity for a parallel "feeder" queue
+	public static final int PROCESS_PER_LOOP = 1000; // The number of chunks to process per main loop in the controller Thread
   
   BigProductAlgebra algebra;
   List<IntArray> ans;
@@ -60,6 +70,7 @@ public class Closer {
   
   ProgressReport report;
   private boolean suppressOutput;
+  public String writeTermMapOnComplete=null;
   
   static final int nCPUs = Runtime.getRuntime().availableProcessors(); 
   
@@ -531,6 +542,21 @@ if (false) {
   }
   
   /**
+   * Parallel version of <code>sgClose</code>. Only works for powers, right now.
+   * @param numThreads The number of threads to use (0=number of available cores)
+   * @return A list of IntArray's
+   */
+  public List<IntArray> sgCloseParallel( int numThreads, int indicesPerChunk ) {
+	  if ( algebra.isPower() ) {
+		  SmallAlgebra alg = algebra.rootFactors().get(0);
+		  alg.makeOperationTables();
+		  return sgClosePowerParallel(generators,0,termMap, numThreads, indicesPerChunk);
+	  }
+	  return null;
+	  // Not Implemented Yet
+  }
+  
+  /**
    * Closure of <tt>elems</tt> under the operations. (Worry about
    * nullary ops later.)
    *
@@ -954,6 +980,365 @@ if (false) {
     return ans;
   }
   
+  
+  /**
+   * Parallel version of <code>sgClosePower</code>. 
+   * Does not look for homomorphisms or failing equations (yet).
+   * @param numThreads The number of threads to use (0=number of available cores)
+   * @param indicesPerChunk - the number of indices to be placed in each calculation chunk
+   */
+  private final List<IntArray> sgClosePowerParallel(List<IntArray> elems, int closedMark, Map<IntArray,Term> termMap, int numThreads, int indicesPerChunk) {
+      if ( numThreads==0 ) numThreads=Runtime.getRuntime().availableProcessors();  
+	  if (report!=null) report.addStartLine("subpower closing ("+numThreads+" threads)...");
+	  final int algSize = algebra.factors().get(0).cardinality();
+	  final List<Operation> ops = algebra.factors().get(0).operations();
+	  final int k = ops.size();
+	  final int[][] opTables = new int[k][];
+	  final int[] arities = new int[k];
+	  final OperationSymbol[] symbols = new OperationSymbol[k];
+//	  boolean nullTable = false;
+	  for (int i = 0; i < k; i++) {
+		  Operation op = ops.get(i);
+		  if (op instanceof OperationWithDefaultValue) {
+			  opTables[i] = ((OperationWithDefaultValue)op).getTotalTable();
+		  } else {
+	          opTables[i] = op.getTable();
+//	          if (opTables[i] == null) nullTable = true;
+	      } // end if-else (op instanceof OperationWIthDefaultValue)
+		  arities[i] = op.arity();
+	      symbols[i] = op.symbol();
+	  } // end for 0 <= i < k
+	  final boolean reportNotNull = report == null ? false : true;
+	  final boolean eltToFindNotNull = eltToFind == null ? false : true;
+	  final boolean eltsToFindNotNull = eltsToFind == null ? false : true;
+	  final boolean operationsNotNull = operations == null ? false : true;
+	  final boolean blocksNotNull = blocks == null ? false : true;
+	  final boolean valuesNotNull = values == null ? false : true;
+	  if (operationsNotNull) termMapForOperations = new HashMap<Operation,Term>();
+	  int operationsFound = 0;
+	    
+	  if ( termMap==null ) {
+		  termMap = new HashMap<IntArray,Term>();
+		  for ( int i = 0; i < generators.size(); i++ ) {
+			  termMap.put(generators.get(i), new VariableImp("x"+i));
+		  } // end for 0 <= i < generators.size()
+	  } // end if ( termMap==null )
+	  final int power = algebra.getNumberOfFactors();
+	  ans = new ArrayList<IntArray>(elems);// IntArrays
+	  final List<int[]> rawList = new ArrayList<int[]>(); // the corresponding raw int[]'s
+	  for (IntArray arr : elems) {
+		  rawList.add(arr.getArray());
+	  } // end for (IntArray arr : elems )
+	  final HashSet<IntArray> su = new HashSet<IntArray>(ans);
+	  //         Code to add the constants
+	  final List<IntArray> constants = algebra.getConstants();// add the constants, if any
+	  for (IntArray arr : constants) {
+		  if (su.add(arr)) {
+			  ans.add(arr);
+			  rawList.add(arr.getArray());
+			  if (termMap != null) {
+				  termMap.put(arr, NonVariableTerm.makeConstantTerm(algebra.constantToSymbol.get(arr)));
+			  } // end if (termMap!=null)
+		  } // end if (su.add(arr))
+	  } // end for (Intarray arr : constants)
+	  int currentMark = ans.size();
+	  int pass = 0;
+//	  final CloserTiming timing = reportNotNull ?  new CloserTiming(algebra, report) : null;
+	  HashMap<IntArray,Term> partResult = null;
+//	  double eltsPerNS = 0;
+	  long passStartTime = 0;
+	  long passFinishTime = 0;
+	  long chunksProcessedThisPass=0;
+	  while ( closedMark < currentMark ) { // for each pass
+		  // Report which pass we're on
+	      String str = "pass: " + pass + ", size: " + ans.size() + "("+(passFinishTime-passStartTime)+"ms)";
+	      passStartTime = System.currentTimeMillis();
+	      if (reportNotNull) {
+//	    	  timing.updatePass(ans.size());
+	    	  report.setPass(pass);
+	    	  report.setPassSize(ans.size());
+	    	  if (!suppressOutput) report.addLine(str);
+	      } else {
+	    	  if (!suppressOutput) System.out.println(str);
+	      } // end if-else (reportNotNull)
+	      LinkedBlockingQueue<SGClosePowerChunk> feeder = new LinkedBlockingQueue<SGClosePowerChunk>(FEEDER_CAPACITY);
+	      LinkedBlockingQueue<HashMap<IntArray,Term>> collector = new LinkedBlockingQueue<HashMap<IntArray,Term>>();
+	      SGClosePowerThread[] workers = new SGClosePowerThread[numThreads-1]; 
+	      boolean[] workersFinished = new boolean[numThreads-1];
+	      HashMap<IntArray,Term> prevTermMap = null;
+    	  prevTermMap = new HashMap<IntArray,Term>();
+    	  prevTermMap.putAll(termMap);
+	      for ( int i = 0; i < numThreads-1; i++) {
+	    	  workers[i] = new SGClosePowerThread(feeder,power,opTables,algSize,arities,indicesPerChunk,closedMark,currentMark,rawList,ops,prevTermMap,symbols,collector,i);
+	    	  workersFinished[i]=false;
+	    	  workers[i].start();
+	      } // end for 0 <= i < numThreads-1
+		  pass++;
+		  chunksProcessedThisPass=0;
+		  long eltsPerChunk=1;
+		  for ( int i = 0; i < indicesPerChunk; i++ ) {
+			  eltsPerChunk=eltsPerChunk*currentMark;
+		  } // end for 0 <= i < indicesPerChunk		  
+		  int opIndex = 0;
+		  SGClosePowerChunk tempChunk = null;
+		  int arity = arities[opIndex];
+		  while ( arity==0 && opIndex < k) {
+			  opIndex++;
+			  if ( opIndex < k ) arity=arities[opIndex];
+		  } // end while ( arity==0 && opIndex < k )
+		  int[] tempSegment = new int[arity<=indicesPerChunk?0:arity-indicesPerChunk];
+		  int chunksToGenerate = 0;
+		  for ( int r = 0; r < k; r++ ) {
+			  int temp = 1;
+			  for ( int i = 0; i < (arities[r]>indicesPerChunk?arities[r]-indicesPerChunk:0); i++ ) {
+				  temp = temp*currentMark;
+			  } // end for 0 <= i < (arities[r]>indicesPerChunk?arities[r]-indicesPerChunk:0)
+			  chunksToGenerate+=temp;
+		  } // end for 0 <= r < k
+		  for ( int i = 0; i < tempSegment.length; i++ ) {
+			  tempSegment[i]=0;
+		  } // end for 0 <= i < tempSegment.length
+		  SequenceIterator intArrayGen = new SequenceIterator(tempSegment,currentMark-1,0);
+		  while (true) {
+			  // check for task cancellation
+			  if (Thread.currentThread().isInterrupted()) {
+				  for ( int i = 0; i < numThreads-1; i++ ) {
+					  if ( workers[i]!=null && workers[i].isAlive() ) {
+						  try {
+							  workers[i].interrupt();
+						  } catch ( SecurityException e ) {
+							  if (reportNotNull) report.addLine("Could not cancel worker thread number " + i + ".");							  
+							  System.err.println("Could not cancel worker thread number " + i + ".");
+							  e.printStackTrace(System.err);
+						  } // end try-catch (SecurityException)
+					  } // end if ( workers[i]!=null && workers[i].isAlive() )
+				  } // end for 0 <= i < numThreads-1 
+				  if (reportNotNull) {
+					  report.setSize(ans.size()); 
+					  report.addEndingLine("cancelled...");
+				  } // end if (reportNotNull)
+				  return null;
+			  } // end if (Thread.currentThread().isInterrupted())
+			  
+			  // Fill the feeder queue
+			  while ( opIndex<k ) {
+				  if ( tempChunk!=null && !feeder.offer(tempChunk) ) break;			
+				  if ( intArrayGen.hasNext() ) {
+					  tempChunk = new SGClosePowerChunk(opIndex,intArrayGen.next());
+					  chunksToGenerate--;
+				  } else {
+					  tempChunk=null;
+					  opIndex++;
+					  if ( opIndex>=k ) break;
+					  arity=arities[opIndex];
+					  while ( arity==0 && opIndex<k ) {
+						  opIndex++;
+						  arity=arities[opIndex];
+					  } // end while ( arity==0 && opIndex<k )
+					  if ( opIndex>= k ) break;
+					  tempSegment = new int[arity<=indicesPerChunk?0:arity-indicesPerChunk];
+					  for ( int i = 0; i < tempSegment.length; i++ ) {
+						  tempSegment[i]=0;
+					  } // end for 0 <= i < tempSegment.length
+					  intArrayGen = new SequenceIterator(tempSegment,currentMark-1,0);
+				  } // end if-else ( intArrayGen.hasNext() )
+			  } // end while (true)
+			  
+			  // check for completion of pass, notify workers
+			  if ( opIndex>=k ) {
+				  if ( feeder.remainingCapacity() >= numThreads-1 ) {
+					  for ( int i = 0; i < numThreads-1; i++ ) {
+						  feeder.offer(SGClosePowerThread.STOP_COMMAND);
+					  } // end for 0 <= i < numThreads-1
+				  } // end if ( feeder.remainingCapacity() >= numThreads-1 )
+			  } // end if ( opIndex>=k )
+			  
+//			  System.err.println("Collector size: " + collector.size()); // DEBUG
+			  for ( int q = 0; q < PROCESS_PER_LOOP; q++ ) {
+			  // collect and evaluate partial answers
+				  if ( collector.size() == 0 ) break;
+			  partResult = collector.poll();
+			  if ( partResult!=null && partResult.size()==1 && partResult.containsValue(null) ) {
+				  workersFinished[((IntArray)partResult.keySet().toArray()[0]).get(0)] = true;
+			  } else if ( partResult!=null ) {
+				  chunksProcessedThisPass++;
+				  List<IntArray> partAns = new ArrayList<IntArray>(partResult.keySet());
+				  for ( IntArray v : partAns ) {
+					  if ( su.add(v) ) {
+						  ans.add(v);
+						  rawList.add(v.getArray());
+//						  if (reportNotNull) timing.incrementNextPassSize();
+						  if ( termMap != null ) {
+							  termMap.put(v, partResult.get(v));
+							  if ( operationsNotNull ) {
+								  Term term = partResult.get(v);
+								  List<Variable> vars = new ArrayList<Variable>(generators.size());
+								  for ( IntArray ia : generators ) {
+									  vars.add((Variable)termMap.get(ia));
+								  } // end for ( IntArray ia : generators )
+								  Operation termOp = term.interpretation(rootAlgebra, vars, true);
+					              for (Operation op : operations) {
+					                  if (Operations.equalValues(termOp, op)) {
+					                	  termMapForOperations.put(op, term);
+					                	  operationsFound++;
+					                	  if (operationsFound == operations.size()) return ans;
+					                  } // end if ( Operations.equalValues(termOp, op) )
+					              } // end for ( Operation op : operations )					              
+							  } // end if ( operationsNotNull )
+						  } // end if ( termMap != null )
+						  if ( eltToFindNotNull && v.equals(eltToFind) ) {
+							  if ( reportNotNull ) {
+								  report.setSize(ans.size()); 
+								  report.addEndingLine("Closing done, found " + eltToFind + ", at " + ans.size());
+							  } // end if ( reportNotNull )
+							  return ans;
+						  } // end if ( eltToFindNotNull && v.equals(eltToFind) )
+						  if ( eltsToFindNotNull && minusOne.equals(indecesMapOfFoundElts.get(v)) ) {
+							  final int index = ans.size()-1;
+							  indecesMapOfFoundElts.put(v, index);
+							  specialEltsFound++;
+							  System.out.println("Found " + v);
+							  if (reportNotNull) report.addLine("Found " + v + ", at " + index);
+							  if ( specialEltsFound == eltsToFind.size() ) {
+								  if (reportNotNull) report.addEndingLine("Closing done, found all " + specialEltsFound + " elements.");
+								  allEltsFound = true;
+								  return ans;
+							  } // end if ( specialEltsFound == eltsToFind.size() )
+						  } // end if ( eltsToFindNotNull && minusOne.equals(indecesMapOfFoundElts.get(v)) )
+						  if ( blocksNotNull ) {
+							  boolean found = false;
+							  if ( valuesNotNull ) {
+								  if ( v.satisfiesConstraint(blocks,values) ) found = true;
+							  } else {
+								  if ( v.satisfiesConstraint(blocks) ) found = true;
+							  } // end if-else ( valuesNotNull )
+							  if (found) {
+								  eltToFind = v;
+								  if (reportNotNull) {
+									  report.setSize(ans.size()); 
+									  report.addEndingLine("Closing done, found " + eltToFind + ", at " + ans.size() );
+								  } // end if (reportNotNull)
+								  return ans;
+							  } // end if (found)
+						  } // end if ( blocksNotNull )
+						  final int size = ans.size();
+						  if ( algebra.cardinality()>0 && size==algebra.cardinality() ) {
+							  if (reportNotNull) {
+								  report.setSize(size);
+								  report.addEndingLine("Found all " + size + " elements.");
+							  } // end if (reportNotNull)
+							  return ans;
+						  } // end if ( algebra.cardinality()>0 && size==algebra.cardinality() )
+					  } // end if ( su.add(v) )
+				  } // end for ( IntArray v : partAns )
+			  } // end else if ( partResult != null )
+			  } // end for 0 <= q < PROCESS_PER_LOOP
+			  
+			  // check for dead workers, print their stack trace to the error stream and notify the user
+			  for ( int i = 0; i < numThreads-1; i++ ) {
+				  if ( workers[i]!=null && !workers[i].isAlive() && workers[i].getStatus()==SGClosePowerThread.RUNNING ) {
+					  System.err.println("Uncaught exception in worker thread number " + i + ".");
+					  StackTraceElement[] blah = workers[i].getStackTrace();
+					  for ( int j = 0; j < blah.length; j++ ) {
+						  System.err.println(blah[j]);
+					  }
+					  workers[i]=null;
+					  if (reportNotNull) report.addLine("Worker " + i + " has died unexpectedly.");
+				  } // end if ( !workers[i].isAlive() && workers[i].status.getStatus()==SmallThreadsafeProgressReport.RUNNING )
+			  } // end for 0 <= i < numThreads-1
+
+			  // For timing and reporting
+/*			  double chunksPerNS = 0;
+			  for ( int i = 0; i < numThreads-1; i++ ) {
+				  if ( workers[i] != null ) chunksPerNS+=workers[i].status.getChunksPerNS();
+			  } // end for 0 <= i < numThreads-1
+			  if ( chunksPerNS <= 0 ) System.err.println("chunksPerNS: " + chunksPerNS);/**/
+
+			  // check for completion of work this pass
+			  boolean allDone = true;
+			  for ( int i = 0; i < numThreads-1; i++ ) {
+				  allDone = allDone && workersFinished[i];
+			  } // for 0 <= i < numThreads-1
+			  if ( allDone ) {
+//				  eltsPerNS=(eltsPerNS+eltsPerChunk*chunksPerNS)/2;
+				  break;			  
+			  } // end if ( allDone )
+
+			  // calculate the timing of it all
+			  if (reportNotNull) {
+				  report.setSize(ans.size());
+				  if ( chunksProcessedThisPass > 0 ) {
+					  report.setTimeLeft(nsToString((chunksToGenerate+feeder.size())*(System.currentTimeMillis()-passStartTime)/chunksProcessedThisPass));
+				  } else {
+					  report.setTimeLeft("Unknown");
+				  } // end if-else ( chunksProcessedThisPass > 0 )
+/*				  if ( chunksPerNS > 0 ) {
+					  report.setTimeLeft(nsToString((chunksToGenerate+feeder.size())/chunksPerNS));
+				  } else {
+					  report.setTimeLeft("Unknown");
+				  } // end if-else ( chunksPerNS > 0 )/**/
+				  long futureElts = 0;
+				  long size = ans.size();
+				  for ( int r = 0; r < k; r++ ) {
+					  long temp = 1;
+					  long temp2 = 1;
+					  for ( int i = 0; i < arities[r]; i++ ) {
+						  temp=temp*size;
+						  temp2=temp2*currentMark;
+					  } // end for 0 <= i < arities[r]
+					  futureElts+=temp-temp2;
+				  } // end for 0 <= r < k
+				  if ( chunksProcessedThisPass > 0 ) {
+					  report.setTimeNext(nsToString(futureElts*(System.currentTimeMillis()-passStartTime)/(eltsPerChunk*chunksProcessedThisPass)));
+				  } else {
+					  report.setTimeLeft("Unknown");
+				  }
+/*				  double denom = eltsPerNS+eltsPerChunk*chunksPerNS;
+				  if ( denom > 0 ) {
+					  report.setTimeNext(nsToString(futureElts/denom));
+				  } else {
+					  report.setTimeNext("Unknown");
+				  } // end if-else ( denom > 0 )/**/
+			  } // if (reportNotNull)
+		  } // end while (true)
+		  closedMark=currentMark;
+		  currentMark=ans.size();
+		  passFinishTime = System.currentTimeMillis();
+	  } // end while ( closedMark < currentMark )
+	  if (reportNotNull) {
+	      final String str = "done closing, size = " + ans.size();
+	      report.setSize(ans.size());
+	      report.addEndingLine(str);
+	  } // end if (reportNotNull)
+      completed = true;
+      if ( writeTermMapOnComplete!=null ) {
+    	  try {
+    		  TermMapWriter.writeTermMap(termMap, writeTermMapOnComplete);
+    		  if (reportNotNull) report.addLine("Written term map to file: "+writeTermMapOnComplete);
+    	  } catch ( FileNotFoundException e ) {    		  
+    	  } // end try-catch FileNotFoundException
+      } // end if ( writeTermMapOnComplete!=null )
+      return ans;
+  } // end sgClosePowerParallel
+  
+  /**
+   * Should be called msToString, as it converts milliseconds into a human-readable string
+   */
+  public static String nsToString(double ns) {
+	  final long totSecs = Math.round(ns/1000);
+	  final long secs = totSecs%60;
+	  final long totMins = totSecs/60;
+	  final long mins = totMins%60;
+	  final long hrs = totMins/60;
+	  String secString = secs<10 ? "0"+Long.toString(secs) : Long.toString(secs);
+	  if ( hrs==0 ) {
+		  if ( mins==0 ) return secString;
+		  return Long.toString(mins) + ":" + secString;
+	  } // end if ( hrs==0 )
+	  String minString = mins<10 ? "0"+Long.toString(mins) : Long.toString(mins);
+	  return Long.toString(hrs) + ":" + minString + ":" + secString;
+  } // end nsToString(double)
+  
   public long countFuncApplications(int size0, int size1) {
     BigInteger ans = BigInteger.ZERO;
     final BigInteger s0 = BigInteger.valueOf(size0);
@@ -1100,6 +1485,29 @@ if (false) {
     
   }
   
+  /**
+   * One chunk of data from <code>sgClosePowerParallel</code> to be sent to a worker thread
+   * @author Jonah Horowitz
+   *
+   */
+  static class SGClosePowerChunk {
+	  public int opIndex;
+	  public int[] initialSegment;
+	  
+	  public SGClosePowerChunk(int newOpIndex, int[] newInitialSegment) {
+		  opIndex=newOpIndex;
+		  initialSegment=newInitialSegment;
+	  }
+	  
+	  @Override
+	  public String toString() {
+		  String ans = opIndex+";";
+		  for ( int i = 0; i < initialSegment.length; i++ ) {
+			  ans+=initialSegment[i]+",";
+		  }
+		  return ans;
+	  }
+  }
   
 }
 
