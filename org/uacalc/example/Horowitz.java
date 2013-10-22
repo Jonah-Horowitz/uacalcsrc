@@ -427,12 +427,14 @@ public class Horowitz {
 	private void checkOn(int i) {
 		if ( taskTypes.get(i).equalsIgnoreCase("jonsson") ) {
 			CLIProgressReport r=reports.get(i);
-			System.out.println("Task Is: "+(tasks.get(i).isAlive()?"Running":"Stopped"));
+			System.out.println("Task is: "+(tasks.get(i).isAlive()?"Running":"Stopped"));
 			System.out.println("Pass: "+r.getPass());
 			System.out.println("Pass Size: "+r.getPassSize());
 			System.out.println("Size: "+r.getSize());
 			System.out.println("Time Left Pass: "+r.getTimeLeft());
 			System.out.println("Time Left Next: "+r.getTimeNext());
+		} else if ( "cancelafter".equalsIgnoreCase(taskTypes.get(i)) ) {
+			System.out.println("Task is: "+(tasks.get(i).isAlive()?"Running":"Stopped"));
 		} // end switch (taskTypes.get(i))
 	} // end checkOn(int)
 	
@@ -466,7 +468,8 @@ public class Horowitz {
 			System.out.println("load <filename>\t\t\tLoads all algebras in <filename> into memory");
 			System.out.println("remove <name>\t\t\tRemoves algebra <name> from memory");
 			System.out.println("jonsson <name> [<#1>,[<#2>]]\t\t\tFinds Jonsson terms for algebra <name> (using <#1> CPUs and <#2> indices per chunk)");
-		} else if ( command.equalsIgnoreCase("quit") || command.equalsIgnoreCase("exit") ) {
+			System.out.println("cancelafter <#1> <#2>\t\t\tCancels task <#1> after <#2> seconds.");
+		} else if ( "quit".equalsIgnoreCase(command) || "exit".equalsIgnoreCase(command) ) {
 			for ( int i = 0; i < tasks.size(); i++ ) {
 				try {
 					tasks.get(i).interrupt();
@@ -476,17 +479,17 @@ public class Horowitz {
 				} // end try-catch (SecurityException)
 			} // end for 0 <= i < tasks.size()
 			return false;
-		} else if ( command.equalsIgnoreCase("list") ) {
+		} else if ( "list".equalsIgnoreCase(command) ) {
 			System.out.println("#\tType\tStatus");
 			for ( int i = 0; i < tasks.size(); i++ ) {
 				System.out.println(i+"\t"+taskTypes.get(i)+"\t"+(tasks.get(i).isAlive()?"Running":"Stopped"));
 			} // end for 0 <= i < tasks.size()
-		} else if ( command.equalsIgnoreCase("algebras") ) {
+		} else if ( "algebras".equalsIgnoreCase(command) ) {
 			System.out.println("Name\tSize\tDescription");
 			for ( String name : algs.keySet() ) {
 				System.out.println(name+"\t"+algs.get(name).cardinality()+"\t"+algs.get(name).getDescription());
 			} // end for name : algs.keySet()
-		} else if ( command.equalsIgnoreCase("cancel") ) {
+		} else if ( "cancel".equalsIgnoreCase(command) ) {
 			if ( params.length == 0 ) {
 				System.out.println("Please specify a task to cancel.");
 				return true;
@@ -501,7 +504,7 @@ public class Horowitz {
 				System.out.println("Cannot cancel task "+params[0]);
 				f.printStackTrace(System.err);
 			} // end try-catch (NumberFormatException) (SecurityException)
-		} else if ( command.equalsIgnoreCase("check") ) {
+		} else if ( "check".equalsIgnoreCase(command) ) {
 			if ( params.length==0 ) {
 				System.out.println("Please specify a task on which to check.");
 				return true;
@@ -518,7 +521,7 @@ public class Horowitz {
 				return true;
 			} // end if ( i<0 || i>tasks.size() )
 			checkOn(i);
-		} else if ( command.equalsIgnoreCase("load") ) {
+		} else if ( "load".equalsIgnoreCase(command) ) {
 			if ( params.length==0 ) {
 				System.out.println("Please specify a file to load.");
 				return true;
@@ -555,7 +558,7 @@ public class Horowitz {
 				algFiles.put(tempName,  fileName.indexOf("\\")!=-1?fileName.substring(fileName.lastIndexOf("\\")+1):fileName);
 				System.out.println("Loaded algebra "+tempName);
 			} // end if ( temp!=null )
-		} else if ( command.equalsIgnoreCase("remove") ) {
+		} else if ( "remove".equalsIgnoreCase(command) ) {
 			if ( params.length==0 ) {
 				System.out.println("Please specify an algebra to remove from memory.");
 				return true;
@@ -566,7 +569,7 @@ public class Horowitz {
 			} // end if ( !algs.containsKey(params[0]) )
 			algs.remove(params[0]);
 			System.out.println("Removed algebra "+params[0]+" from memory.");
-		} else if ( command.equalsIgnoreCase("jonsson") ) {
+		} else if ( "jonsson".equalsIgnoreCase(command) ) {
 			if ( params.length==0 ) {
 				System.out.println("Please specify an algebra for which to calculate Jonsson operations.");
 				return true;
@@ -603,11 +606,62 @@ public class Horowitz {
 			taskTypes.add("jonsson");
 			runner.start();
 			System.out.println("Started a Jonsson terms task on algebra "+params[0]);
+		} else if ( "cancelafter".equalsIgnoreCase(command) ) {
+			if ( params.length<2 ) {
+				System.out.println("Syntax: cancelafter <#1> <#2>");
+				return true;
+			} // end if ( params.length<2 )
+			int num = -1;
+			int secs = -1;
+			try {
+				num = Integer.parseInt(params[0]);
+			} catch ( NumberFormatException e ) {
+				System.out.println(params[0]+" is not a number.");
+				return true;
+			} // end try-catch NumberFormatException
+			try {
+				secs = Integer.parseInt(params[1]);
+			} catch ( NumberFormatException e ) {
+				System.out.println(params[1]+" is not a number.");
+				return true;
+			} // end try-catch NumberFormatException
+			Thread runner = new Thread(new CancelWaiter(num,secs));
+			reports.add(null);
+			tasks.add(runner);
+			taskTypes.add("cancelafter");
+			runner.start();
+			System.out.println("Started a cancelAfter task on task "+num+".");
 		} else {
 			System.out.println("That is not a recognized command.");
 		} // end switch (command)
 		return true;
 	} // end interpretCommand(String, String[])
+	
+	/**
+	 * Cancels a task after a time.
+	 * @author Jonah Horowitz
+	 */
+	private class CancelWaiter implements Runnable {
+		private int target;
+		private int secs;
+		
+		/**
+		 * @param n The number of the task to cancel
+		 * @param s The number of seconds to wait
+		 */
+		public CancelWaiter(int n, int s) {
+			target=n;
+			secs=s;
+		} // end constructor()
+		
+		@Override
+		public void run() {
+			try {
+				Thread.sleep(secs*1000);
+			} catch ( InterruptedException e ) {}
+			tasks.get(target).interrupt();
+		} // end run()
+	} // end class CancelWaiter
 	
 	/**
 	 * Runs a search for Jonsson terms.
