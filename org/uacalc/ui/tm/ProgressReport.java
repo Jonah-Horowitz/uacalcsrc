@@ -78,7 +78,8 @@ public class ProgressReport {
   public String getTimeLeft() { return timeLeft; }
   public void setTimeLeft(String time) {
     timeLeft = time;
-    getTaskTableModel().fireTableDataChanged();
+    if ( taskTableModel != null ) 
+    	getTaskTableModel().fireTableDataChanged();
   }
   
   public String getTimeNext() { return timeNext; }
