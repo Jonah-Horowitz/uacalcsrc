@@ -1023,7 +1023,7 @@ public class CongruenceLattice implements Lattice {
    * This assumes a < b.
    */
   private Partition makeCg(int a, int b, final ProgressReport report) {
-    System.out.println("a and b: " + a + ", " + b);
+//    System.out.println("a and b: " + a + ", " + b);
     int[] part = new int[algSize];
     for (int i = 0; i < algSize; i++ ) {
       part[i] = -1;
