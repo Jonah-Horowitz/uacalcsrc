@@ -301,7 +301,8 @@ public class FreeAlgebra extends SubProductAlgebra implements SmallAlgebra {
   private void makeUniverse(ProgressReport report) {
     univ = productAlgebra.sgClose(gens, termMap, null, report);
     size = univ.size();
-    logger.info("free algebra size = " + size);
+    if (report!=null) report.addLine("Free algebra size = "+size);
+//    logger.info("free algebra size = " + size);
     univHashMap = new HashMap<IntArray, Integer>(size);
     terms = new Term[univ.size()];
     int k = 0;
