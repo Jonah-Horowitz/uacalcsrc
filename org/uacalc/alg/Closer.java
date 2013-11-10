@@ -547,10 +547,11 @@ if (false) {
    * @return A list of IntArray's
    */
   public List<IntArray> sgCloseParallel( int numThreads, int indicesPerChunk ) {
+	  if ( numThreads==0 ) numThreads=Runtime.getRuntime().availableProcessors();
 	  if ( algebra.isPower() ) {
 		  SmallAlgebra alg = algebra.rootFactors().get(0);
 		  alg.makeOperationTables();
-		  return sgClosePowerParallel(generators,0,termMap, numThreads, indicesPerChunk);
+		  return sgClosePowerParallel(generators,0,termMap, numThreads, indicesPerChunk, numThreads>8);
 	  }
 	  return null;
 	  // Not Implemented Yet
@@ -987,9 +988,10 @@ if (false) {
    * @param numThreads The number of threads to use (0=number of available cores)
    * @param indicesPerChunk - the number of indices to be placed in each calculation chunk
    */
-  private final List<IntArray> sgClosePowerParallel(List<IntArray> elems, int closedMark, Map<IntArray,Term> termMap, int numThreads, int indicesPerChunk) {
+  private final List<IntArray> sgClosePowerParallel(List<IntArray> elems, int closedMark, Map<IntArray,Term> termMap, int numThreads, final int indicesPerChunk, boolean splitFeeder) {
       if ( numThreads==0 ) numThreads=Runtime.getRuntime().availableProcessors();  
-	  if (report!=null) report.addStartLine("subpower closing ("+numThreads+" threads)...");
+	  final int numWorkers=splitFeeder?numThreads-2:numThreads-1;
+	  if (report!=null) report.addStartLine("subpower closing ("+numWorkers+" workers)...");
 	  final int algSize = algebra.factors().get(0).cardinality();
 	  final List<Operation> ops = algebra.factors().get(0).operations();
 	  final int k = ops.size();
@@ -1061,32 +1063,26 @@ if (false) {
 	      } else {
 	    	  if (!suppressOutput) System.out.println(str);
 	      } // end if-else (reportNotNull)
-	      LinkedBlockingQueue<SGClosePowerChunk> feeder = new LinkedBlockingQueue<SGClosePowerChunk>(FEEDER_CAPACITY);
-	      LinkedBlockingQueue<HashMap<IntArray,Term>> collector = new LinkedBlockingQueue<HashMap<IntArray,Term>>();
-	      SGClosePowerThread[] workers = new SGClosePowerThread[numThreads-1]; 
-	      boolean[] workersFinished = new boolean[numThreads-1];
+		  int unusedPasses=0;
+	      final LinkedBlockingQueue<SGClosePowerThread.SGClosePowerChunk> feeder = new LinkedBlockingQueue<SGClosePowerThread.SGClosePowerChunk>(FEEDER_CAPACITY);
+	      final LinkedBlockingQueue<SGClosePowerThread.SGClosePowerResult> collector = new LinkedBlockingQueue<SGClosePowerThread.SGClosePowerResult>();
+	      SGClosePowerThread[] workers = new SGClosePowerThread[numWorkers]; 
+	      boolean[] workersFinished = new boolean[numWorkers];
 	      HashMap<IntArray,Term> prevTermMap = null;
     	  prevTermMap = new HashMap<IntArray,Term>();
     	  prevTermMap.putAll(termMap);
-	      for ( int i = 0; i < numThreads-1; i++) {
-	    	  workers[i] = new SGClosePowerThread(feeder,power,opTables,algSize,arities,indicesPerChunk,closedMark,currentMark,rawList,ops,prevTermMap,symbols,collector,i);
+	      for ( int i = 0; i < numWorkers; i++) {
+	    	  workers[i] = new SGClosePowerThread(feeder,power,opTables,algSize,arities,indicesPerChunk,closedMark,currentMark,rawList,ops,prevTermMap,symbols,collector,i,null,null,0);
+//	    	  workers[i].setPriority(Thread.MIN_PRIORITY);
 	    	  workersFinished[i]=false;
 	    	  workers[i].start();
-	      } // end for 0 <= i < numThreads-1
+	      } // end for 0 <= i < numWorkers
 		  pass++;
 		  chunksProcessedThisPass=0;
 		  long eltsPerChunk=1;
 		  for ( int i = 0; i < indicesPerChunk; i++ ) {
 			  eltsPerChunk=eltsPerChunk*currentMark;
 		  } // end for 0 <= i < indicesPerChunk		  
-		  int opIndex = 0;
-		  SGClosePowerChunk tempChunk = null;
-		  int arity = arities[opIndex];
-		  while ( arity==0 && opIndex < k) {
-			  opIndex++;
-			  if ( opIndex < k ) arity=arities[opIndex];
-		  } // end while ( arity==0 && opIndex < k )
-		  int[] tempSegment = new int[arity<=indicesPerChunk?0:arity-indicesPerChunk];
 		  int chunksToGenerate = 0;
 		  for ( int r = 0; r < k; r++ ) {
 			  int temp = 1;
@@ -1095,14 +1091,92 @@ if (false) {
 			  } // end for 0 <= i < (arities[r]>indicesPerChunk?arities[r]-indicesPerChunk:0)
 			  chunksToGenerate+=temp;
 		  } // end for 0 <= r < k
+		  
+		  final int maxIndex = currentMark-1;
+		  
+		  /**
+		   * This class fills the feeder <code>java.util.concurrent.BlockingQueue</code> in a separate thread.
+		   * @author Jonah Horowitz
+		   */
+		  class SGFeederRunner implements Runnable {
+			  private int opIndex=-1;
+			  private int arity;
+			  private SequenceIterator intArrayGen;
+			  private SGClosePowerThread.SGClosePowerChunk tempChunk = null;
+			  
+			  public SGFeederRunner() {
+				  nextOp();
+			  } // constructor()
+			  
+			  private void nextOp() {
+				  tempChunk=null;
+				  opIndex++;
+				  if ( opIndex>=k ) return;
+				  arity=arities[opIndex];
+				  while ( arity==0 && opIndex<k ) {
+					  opIndex++;
+					  arity=arities[opIndex];
+				  } // end while ( arity==0 && opIndex<k )
+				  int[] tempSegment = new int[arity<=indicesPerChunk?0:arity-indicesPerChunk];
+				  for ( int i = 0; i < tempSegment.length; i++ ) {
+					  tempSegment[i]=0;
+				  } // end for 0 <= i < tempSegment.length;
+				  intArrayGen=new SequenceIterator(tempSegment,maxIndex,0);
+			  } // end nextOp()
+			  
+			  public boolean hasMore() {
+				  return opIndex<k;
+			  } // end hasMore()
+			  
+			  public void fillQueue() {
+				  while ( opIndex < k  && feeder.remainingCapacity()!=0 ) {
+					  if ( tempChunk!=null && !feeder.offer(tempChunk) ) return;
+					  if ( !intArrayGen.hasNext() ) nextOp();
+					  tempChunk=new SGClosePowerThread.SGClosePowerChunk(opIndex,intArrayGen.next());
+				  } // end while ( opIndex<k && feeder.remainingCapacity()!=0 )
+			  } // end fillQueue()
+			  
+			  @Override
+			  public void run() {
+				  while ( hasMore() ) {
+					  fillQueue();
+					  try {
+						  Thread.sleep(SGClosePowerThread.SLEEP_TIME);
+					  } catch ( InterruptedException e ) {}
+				  } // end while ( hasMore() )
+				  while ( feeder.remainingCapacity()<numWorkers ) {
+					  try {
+						  Thread.sleep(SGClosePowerThread.SLEEP_TIME);
+					  } catch ( InterruptedException e ) {}
+				  } // end while ( feeder.remainingCapacity()<numWorkers )
+				  for ( int i = 0; i < numWorkers; i++ ) {
+					  feeder.offer(SGClosePowerThread.STOP_COMMAND);
+				  } // end for 0 <= i < numWorkers
+			  } // end run()
+		  } // end class SGFeederRunner
+		  
+		  SGFeederRunner feederRunner = new SGFeederRunner();
+		  Thread feederThread = null;
+		  if ( splitFeeder ) {
+			  feederThread = new Thread(feederRunner);
+			  feederThread.start();
+		  } // end if ( splitFeeder )
+/*		  int opIndex = 0;
+		  SGClosePowerChunk tempChunk = null;
+		  int arity = arities[opIndex];
+		  while ( arity==0 && opIndex < k) {
+			  opIndex++;
+			  if ( opIndex < k ) arity=arities[opIndex];
+		  } // end while ( arity==0 && opIndex < k )
+		  int[] tempSegment = new int[arity<=indicesPerChunk?0:arity-indicesPerChunk];
 		  for ( int i = 0; i < tempSegment.length; i++ ) {
 			  tempSegment[i]=0;
 		  } // end for 0 <= i < tempSegment.length
-		  SequenceIterator intArrayGen = new SequenceIterator(tempSegment,currentMark-1,0);
+		  SequenceIterator intArrayGen = new SequenceIterator(tempSegment,currentMark-1,0);/**/
 		  while (true) {
 			  // check for task cancellation
 			  if (Thread.currentThread().isInterrupted()) {
-				  for ( int i = 0; i < numThreads-1; i++ ) {
+				  for ( int i = 0; i < numWorkers; i++ ) {
 					  if ( workers[i]!=null && workers[i].isAlive() ) {
 						  try {
 							  workers[i].interrupt();
@@ -1112,7 +1186,7 @@ if (false) {
 							  e.printStackTrace(System.err);
 						  } // end try-catch (SecurityException)
 					  } // end if ( workers[i]!=null && workers[i].isAlive() )
-				  } // end for 0 <= i < numThreads-1 
+				  } // end for 0 <= i < numWorkers
 				  if (reportNotNull) {
 					  report.setSize(ans.size()); 
 					  report.addEndingLine("cancelled...");
@@ -1120,8 +1194,18 @@ if (false) {
 				  return null;
 			  } // end if (Thread.currentThread().isInterrupted())
 			  
+			  if ( !splitFeeder ) {
+				  feederRunner.fillQueue();
+				  if ( !feederRunner.hasMore() ) {
+					  if ( feeder.remainingCapacity()>=numWorkers ) {
+						  for ( int i = 0; i < numWorkers; i++ ) {
+							  feeder.offer(SGClosePowerThread.STOP_COMMAND);
+						  } // end for 0 <= i < numWorkers
+					  } // end if ( feeder.remainingCapacity()>=numWorkers )
+				  } // end if ( !feederRunner.hasMore() )
+			  } // end if ( !splitFeeder )
 			  // Fill the feeder queue
-			  while ( opIndex<k ) {
+/*			  while ( opIndex<k ) {
 				  if ( tempChunk!=null && !feeder.offer(tempChunk) ) break;			
 				  if ( intArrayGen.hasNext() ) {
 					  tempChunk = new SGClosePowerChunk(opIndex,intArrayGen.next());
@@ -1142,22 +1226,29 @@ if (false) {
 					  } // end for 0 <= i < tempSegment.length
 					  intArrayGen = new SequenceIterator(tempSegment,currentMark-1,0);
 				  } // end if-else ( intArrayGen.hasNext() )
-			  } // end while (true)
+			  } // end while (true)/**/
 			  
 			  // check for completion of pass, notify workers
-			  if ( opIndex>=k ) {
+/*			  if ( opIndex>=k ) {
 				  if ( feeder.remainingCapacity() >= numThreads-1 ) {
 					  for ( int i = 0; i < numThreads-1; i++ ) {
 						  feeder.offer(SGClosePowerThread.STOP_COMMAND);
 					  } // end for 0 <= i < numThreads-1
 				  } // end if ( feeder.remainingCapacity() >= numThreads-1 )
-			  } // end if ( opIndex>=k )
+			  } // end if ( opIndex>=k )/**/
 			  
+			  if ( collector.size()==0 ) unusedPasses++;
+			  if ( unusedPasses>=100 ) {
+				  try {
+					  Thread.sleep(1000);
+				  } catch ( InterruptedException e ) {}
+				  unusedPasses=0;
+			  }
 //			  System.err.println("Collector size: " + collector.size()); // DEBUG
 			  for ( int q = 0; q < PROCESS_PER_LOOP; q++ ) {
 			  // collect and evaluate partial answers
 				  if ( collector.size() == 0 ) break;
-			  partResult = collector.poll();
+			  partResult = collector.poll().termMap;
 			  if ( partResult!=null && partResult.size()==1 && partResult.containsValue(null) ) {
 				  workersFinished[((IntArray)partResult.keySet().toArray()[0]).get(0)] = true;
 			  } else if ( partResult!=null ) {
@@ -1235,7 +1326,7 @@ if (false) {
 			  } // end for 0 <= q < PROCESS_PER_LOOP
 			  
 			  // check for dead workers, print their stack trace to the error stream and notify the user
-			  for ( int i = 0; i < numThreads-1; i++ ) {
+			  for ( int i = 0; i < numWorkers; i++ ) {
 				  if ( workers[i]!=null && !workers[i].isAlive() && workers[i].getStatus()==SGClosePowerThread.RUNNING ) {
 					  System.err.println("Uncaught exception in worker thread number " + i + ".");
 					  StackTraceElement[] blah = workers[i].getStackTrace();
@@ -1245,7 +1336,7 @@ if (false) {
 					  workers[i]=null;
 					  if (reportNotNull) report.addLine("Worker " + i + " has died unexpectedly.");
 				  } // end if ( !workers[i].isAlive() && workers[i].status.getStatus()==SmallThreadsafeProgressReport.RUNNING )
-			  } // end for 0 <= i < numThreads-1
+			  } // end for 0 <= i < numWorkers
 
 			  // For timing and reporting
 /*			  double chunksPerNS = 0;
@@ -1256,7 +1347,7 @@ if (false) {
 
 			  // check for completion of work this pass
 			  boolean allDone = true;
-			  for ( int i = 0; i < numThreads-1; i++ ) {
+			  for ( int i = 0; i < numWorkers; i++ ) {
 				  allDone = allDone && workersFinished[i];
 			  } // for 0 <= i < numThreads-1
 			  if ( allDone ) {
@@ -1490,24 +1581,24 @@ if (false) {
    * @author Jonah Horowitz
    *
    */
-  static class SGClosePowerChunk {
+/*  static class SGClosePowerChunk {
 	  public int opIndex;
 	  public int[] initialSegment;
 	  
 	  public SGClosePowerChunk(int newOpIndex, int[] newInitialSegment) {
 		  opIndex=newOpIndex;
 		  initialSegment=newInitialSegment;
-	  }
+	  } // end constructor(int, int[])
 	  
 	  @Override
 	  public String toString() {
 		  String ans = opIndex+";";
 		  for ( int i = 0; i < initialSegment.length; i++ ) {
 			  ans+=initialSegment[i]+",";
-		  }
+		  } // end for 0 <= i < initialSegment.length
 		  return ans;
-	  }
-  }
+	  } // end toString()
+  } // end class SGClosePowerChunk/**/
   
 }
 

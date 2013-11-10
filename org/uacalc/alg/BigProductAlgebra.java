@@ -230,6 +230,23 @@ public class BigProductAlgebra extends GeneralAlgebra implements Algebra {
             //System.out.println("ans2:  " + ArrayString.toString(ans2));
             return ans2;
           }
+          
+          public int intValueAt(int[] args) {
+        	  int[][] argList = new int[args.length][];
+        	  for ( int j = 0; j < args.length; j++ ) argList[j]=Horner.hornerInv(args[j], sizes);
+        	  int[][] argList2 = new int[numberOfFactors][];
+        	  for ( int j = 0; j < numberOfFactors; j++ ) argList2[j] = new int[args.length];
+        	  for ( int j = 0; j < args.length; j++ ) 
+        		  for ( int j2 = 0; j2 < numberOfFactors; j2++ ) 
+        			  argList2[j2][j]=argList[j][j2];
+        	  int[] ans2 = new int[numberOfFactors];
+        	  for ( int j = 0; j < numberOfFactors; j++ ) ans2[j] = opList.get(j).intValueAt(argList2[j]);
+        	  return Horner.horner(ans2, sizes);
+          } // end intValueAt(int[])
+          
+          public int intValueAt(int arg2) {
+        	  return intValueAt(Horner.hornerInv(arg2, cardinality(), arity));
+          } // end intValueAt(int)
       };
       ops.add(op);
     }

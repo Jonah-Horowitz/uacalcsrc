@@ -58,7 +58,7 @@ public abstract class AbstractOperation implements Operation {
 
 
   public int intValueAt(int[] args) {
-    logger.warning("intValueAt is not define.");
+    logger.warning("intValueAt is not defined.");
     logger.info("op symbol is " + symbol());
     logger.info("args = " + org.uacalc.util.ArrayString.toString(args));
 

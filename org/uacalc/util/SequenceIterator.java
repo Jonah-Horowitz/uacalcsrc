@@ -14,10 +14,12 @@ public class SequenceIterator {
 	public SequenceIterator(int[] start, int newMax, int newMin) {
 		min=newMin;
 		max=newMax;
+		if ( start==null ) start = new int[0];
 		current = new int[start.length];
 		for ( int i = 0; i < start.length; i++ ) {
 			current[i] = start[i];
-		}
+		} // end for 0 <= i < start.length
+		if ( current.length==0 ) hasNext=false;
 		inc = SequenceGenerator.sequenceIncrementor(current, max, min);
 	} // end constructor(int[], int, int)
 	

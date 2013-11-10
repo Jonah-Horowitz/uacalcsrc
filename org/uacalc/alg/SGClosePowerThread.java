@@ -5,10 +5,10 @@ import org.uacalc.terms.*;
 import java.util.*;
 
 import org.uacalc.util.*;
-import org.uacalc.alg.Closer.SGClosePowerChunk;
 import org.uacalc.alg.op.*;
-import java.util.concurrent.Semaphore;
+import org.uacalc.eq.*;
 
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.BlockingQueue;
 
 /**
@@ -26,21 +26,24 @@ public class SGClosePowerThread extends Thread {
 	
 	private Semaphore statusLock = new Semaphore(1);
 	private int status = WAITING;
-	private BlockingQueue<SGClosePowerChunk> feeder;
+	BlockingQueue<SGClosePowerChunk> feeder;
 	private int power;
 	private int[][] opTables;
 	private int algSize;
 	private int[] arities;
-	private int indicesPerChunk;
-	private int closedMark;
-	private int currentMark;
-	private List<int[]> rawList;
-	private List<Operation> ops;
-	private HashMap<IntArray,Term> prevTermMap;
-	private OperationSymbol[] symbols;
-	private BlockingQueue<HashMap<IntArray,Term>> collector;
-	private LinkedList<HashMap<IntArray,Term>> resultsQueue;
-	private int threadNumber;
+	int indicesPerChunk;
+	int closedMark;
+	int currentMark;
+	List<int[]> rawList;
+	List<Operation> ops;
+	HashMap<IntArray,Term> prevTermMap;
+	OperationSymbol[] symbols;
+	BlockingQueue<SGClosePowerResult> collector;
+	LinkedList<SGClosePowerResult> resultsQueue;
+	int threadNumber;
+	int[][] imgOpTables;
+	HashMap<IntArray,Integer> prevHomomorphism;
+	int imgAlgSize;
 
 	/**
 	 * Sets this thread's status
@@ -68,8 +71,8 @@ public class SGClosePowerThread extends Thread {
 	 */
 	public SGClosePowerThread(BlockingQueue<SGClosePowerChunk> newFeeder, int newPower, int[][] newOpTables, int newAlgSize, 
 			int[] newArities, int newIndicesPerChunk, int newClosedMark, int newCurrentMark, List<int[]> newRawList, List<Operation> newOps,
-			HashMap<IntArray,Term> newPrevTermMap, OperationSymbol[] newSymbols, BlockingQueue<HashMap<IntArray,Term>> newCollector,
-			int newThreadNumber) {
+			HashMap<IntArray,Term> newPrevTermMap, OperationSymbol[] newSymbols, BlockingQueue<SGClosePowerResult> newCollector,
+			int newThreadNumber, int[][] newImgOpTables, HashMap<IntArray,Integer> newPrevHomomorphism, int newImgAlgSize) {
 		super();
 		feeder=newFeeder;
 		power=newPower;
@@ -84,14 +87,17 @@ public class SGClosePowerThread extends Thread {
 		prevTermMap = newPrevTermMap;
 		symbols = newSymbols;
 		collector=newCollector;
-		resultsQueue = new LinkedList<HashMap<IntArray,Term>>();
+		resultsQueue = new LinkedList<SGClosePowerResult>();
 		threadNumber = newThreadNumber;
+		imgOpTables = newImgOpTables;
+		prevHomomorphism = newPrevHomomorphism;
+		imgAlgSize = newImgAlgSize;
 	} // end constructor(BlockingQueue<SGClosePowerChunk>, int, int[][], int, int[], int, int, int, List<int[]>, List<Operation>, HashMap<IntArray,Term>, OperationSymbol[], BlockingQueue<HashMap<IntArray,Term>>, int)
 	
 	/**
 	 * Returns whether or not <code>indices</code> has an element greater than or equal to <code>min</code>
 	 */
-	private static boolean hasOverMin(int[] indices, int min) {
+	public static boolean hasOverMin(int[] indices, int min) {
 		for ( int i = 0; i < indices.length; i++ ) {
 			if ( indices[i] >= min ) return true;
 		} // end for 0 <= i < indices.length
@@ -101,7 +107,7 @@ public class SGClosePowerThread extends Thread {
 	/**
 	 * Concatenates two int[]'s
 	 */
-	private static int[] concatenateIntArrays(int[] a1, int[] a2) {
+	public static int[] concatenateIntArrays(int[] a1, int[] a2) {
 		int[] ans = new int[a1.length+a2.length];
 		for ( int i = 0; i < a1.length; i++ ) {
 			ans[i]=a1[i];
@@ -121,6 +127,8 @@ public class SGClosePowerThread extends Thread {
 		int[] finalSegment = null;
 		ArrayIncrementor inc = null;
 		HashSet<IntArray> su = null;
+		HashMap<IntArray,Integer> morphism = null;
+		Equation failingEquation = null;
 		while (true) {
 			if ( this.isInterrupted() ) {
 				setStatus(SAFE_STOP);
@@ -136,6 +144,8 @@ public class SGClosePowerThread extends Thread {
 					finalSegment = new int[indicesPerChunk];
 					su = new HashSet<IntArray>();
 					termMap = new HashMap<IntArray,Term>();
+					morphism = prevHomomorphism==null?null:new HashMap<IntArray,Integer>();
+					failingEquation=null;
 					for ( int i = 0; i < indicesPerChunk; i++ ) {
 						finalSegment[i]=0;
 					} // end for 0 <= i < indicesPerChunk
@@ -151,6 +161,8 @@ public class SGClosePowerThread extends Thread {
 					inc = null;
 					su = null;
 					termMap = null;
+					morphism = null;
+					failingEquation = null;
 //					startTime=-1;
 					try {
 						Thread.sleep(SLEEP_TIME);
@@ -184,16 +196,36 @@ public class SGClosePowerThread extends Thread {
 					} // end for 0 <= j < power
 				} // end if-else ( opTable != null )
 				IntArray v = new IntArray(vRaw);
-				if (su.add(v)) {
+				if ( !prevTermMap.containsKey(v) && su.add(v)) {
+					if (prevTermMap.size()>0) {
 					List<Term> children = new ArrayList<Term>(arity);
-					for ( int r = 0; r < arity; r++ ) {
-						children.add(prevTermMap.get(new IntArray(rawList.get(argIndices[r]))));
-					} // end for 0 <= r < arity
-					termMap.put(v,new NonVariableTerm(symbols[tempChunk.opIndex],children));
-				} // end if ( su.add(v) )
+						for ( int r = 0; r < arity; r++ ) {
+							children.add(prevTermMap.get(new IntArray(rawList.get(argIndices[r]))));
+						} // end for 0 <= r < arity
+						termMap.put(v,new NonVariableTerm(symbols[tempChunk.opIndex],children));
+					} else {
+						termMap.put(v, null);
+					} // end if-else (prevTermMap.size()>0)
+					if ( prevHomomorphism!=null ) {
+						final int[] args = new int[arity];
+						for ( int t = 0; t < arity; t++ ) args[t]=prevHomomorphism.get(new IntArray(rawList.get(argIndices[t])));
+						morphism.put(v, imgOpTables[tempChunk.opIndex][Horner.horner(args, imgAlgSize)]);
+					} // end if ( prevHomomorphism!=null )
+				} else {
+					if ( prevHomomorphism!=null ) {
+						final int[] args = new int[arity];
+						for ( int t = 0; t < arity; t++ ) args[t]=prevHomomorphism.get(new IntArray(rawList.get(argIndices[t])));
+						int v2 = prevHomomorphism.containsKey(v)?prevHomomorphism.get(v).intValue():morphism.get(v).intValue();
+						if ( v2!=imgOpTables[tempChunk.opIndex][Horner.horner(args, imgAlgSize)]) {
+							List<Term> children = new ArrayList<Term>(arity);
+							for ( int r = 0; r < arity; r++ ) children.add(prevTermMap.get(new IntArray(rawList.get(argIndices[r]))));
+							failingEquation = new Equation(prevTermMap.containsKey(v)?prevTermMap.get(v):termMap.get(v),new NonVariableTerm(symbols[tempChunk.opIndex],children));
+						} // end if ( v2!=imgOpTables[tempChunk.opIndex][Horner.horner(args, imgAlgSize)])
+					} // end if ( prevHomomorphism!=null )
+				} // end if-else ( !prevTermMap.containsKey(v) && su.add(v) )
 			} // end if ( tempChunk!=null )
 			while ( resultsQueue.size() > 0 ) {
-				HashMap<IntArray,Term> presult = resultsQueue.poll();
+				SGClosePowerResult presult = resultsQueue.poll();
 				if ( !collector.offer(presult) ) {
 					resultsQueue.addFirst(presult);
 					break;
@@ -201,25 +233,69 @@ public class SGClosePowerThread extends Thread {
 			} // end while ( resultsQueue.size() > 0 )
 			if ( tempChunk!=null && !inc.increment() ) {
 				tempChunk=null;
+				SGClosePowerResult tempRes = new SGClosePowerResult(termMap, morphism, failingEquation);
 //				status.addChunk(System.currentTimeMillis()-startTime);
-				if ( !collector.offer(termMap) ) {
-					resultsQueue.add(termMap);
-				} else {
-					termMap = null;
-				} // end if-else ( !collector.offer(termMap) )
+				if ( !collector.offer(tempRes) ) {
+					resultsQueue.add(tempRes);
+				} // end if ( !collector.offer(tempRes) )
+				termMap = null;
+				morphism = null;
 			} // end if ( tempChunk!=null && !inc.increment() )
 		} // end while (true)
-		HashMap<IntArray,Term> completed = new HashMap<IntArray,Term>();
-		completed.put(new IntArray(new int[] {threadNumber}), null);
+		SGClosePowerResult completed = new SGClosePowerResult(threadNumber);
 		while ( !collector.offer(completed) ) {
 			try {
 				Thread.sleep(SLEEP_TIME);
 			} catch ( InterruptedException e ) {
 				System.err.println("Worker thread " + threadNumber + " was interrupted while sleeping.");
 				break;
-			}
-		}
+			} // end try-catch InterruptedException
+		} // end while (!collector.offer(completed))
 		setStatus(SAFE_STOP);
 	} // end run()
 
+	/**
+	 * Represents a single chunk of data to be passed to this type of thread
+	 * @author Jonah Horowitz
+	 */
+	public static class SGClosePowerChunk {
+		public int opIndex;
+		public int[] initialSegment;
+		
+		public SGClosePowerChunk(int newOpIndex, int[] newInitialSegment) {
+			opIndex=newOpIndex;
+			initialSegment=newInitialSegment;
+		} // end constructor(int,int[])
+		
+		@Override
+		public String toString() {
+			String ans = opIndex+";";
+			for ( int i = 0; i < initialSegment.length; i++ ) ans+=initialSegment[i]+",";
+			return ans;
+		} // end toString()
+		
+	} // end class SGClosePowerChunk
+	
+	/**
+	 * Used to represent output data from a single input chunk. Intended for use once I figure out how to get homomorphism checking working in parallel.
+	 * @author Jonah Horowitz
+	 */
+	public static class SGClosePowerResult {
+		public HashMap<IntArray,Term> termMap;
+		public HashMap<IntArray,Integer> homomorphism;
+		public Equation failingEquation;
+		public int completed=-1;
+		
+		public SGClosePowerResult(HashMap<IntArray,Term> newTermMap, HashMap<IntArray,Integer> newHomomorphism, Equation newFailingEquation) {
+			termMap=newTermMap;
+			homomorphism=newHomomorphism;
+			failingEquation=newFailingEquation;
+		} // end constructor(HashMap<IntArray,Term>, HashMap<IntArray,Integer>, Equation)
+		
+		public SGClosePowerResult(int threadNum) {
+			this(null, null, null);
+			completed=threadNum;			
+		} // end constructor(int)
+		
+	} // end class SGClosePowerResult
 } // end class SGClosePowerThread

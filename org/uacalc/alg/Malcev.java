@@ -877,7 +877,7 @@ org.uacalc.ui.LatDrawer.drawLattice(new org.uacalc.lat.BasicLattice("", maxLevel
   }
   
   public static List<Term> jonssonTerms(SmallAlgebra alg, boolean alvinVariant, ProgressReport report) {
-	  return jonssonTerms(alg, alvinVariant, report, 1, 0, null);
+	  return jonssonTerms(alg, alvinVariant, report, 0, 1, null);
   }
   
   /**

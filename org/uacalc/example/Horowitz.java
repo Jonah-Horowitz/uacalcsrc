@@ -6,8 +6,8 @@ import org.uacalc.alg.*;
 import java.util.*;
 
 import org.uacalc.util.Horner;
+import org.uacalc.util.IntArray;
 import org.uacalc.io.*;
-
 import org.uacalc.ui.tm.CLIProgressReport;
 import org.uacalc.terms.*;
 
@@ -438,6 +438,40 @@ public class Horowitz {
 		} // end switch (taskTypes.get(i))
 	} // end checkOn(int)
 	
+	private static boolean check3GeneratedSubalgebras(SmallAlgebra alg, int power) {
+		SmallProductAlgebra bpa = new SmallProductAlgebra(alg, power);
+		int algSize = alg.cardinality();
+		int productSize = bpa.cardinality();
+		for ( int i = 0; i < productSize-2; i++ ) {
+			for ( int j = i+1; j < productSize-1; j++ ) {
+				for ( int k = j+1; k < productSize; k++ ) {
+					List<IntArray> gens = new ArrayList<IntArray>();
+					gens.add(new IntArray(Horner.hornerInv(i, algSize, power)));
+					gens.add(new IntArray(Horner.hornerInv(j, algSize, power)));
+					gens.add(new IntArray(Horner.hornerInv(k, algSize, power)));
+					Closer2 c1 = (new Closer2(bpa, gens, true)).setPassDecisionProcedure(Closer2.SERIAL).setStopEachPass(true);
+					Closer2 c2 = (new Closer2(bpa, gens, true)).setPassDecisionProcedure(Closer2.PARALLEL).setStopEachPass(true);
+					int passCounter = 0;
+					while ( !c1.getCompleted() && !c2.getCompleted() ) {
+						passCounter++;
+						c1.sgClose();
+						c2.sgClose();
+						if ( !c1.equalCalculationStage(c2) ) {
+							System.err.println("Error found.\nElements: ["+i+","+j+","+k+"]\nPass: "+passCounter);
+							return false;
+						} // end if ( !c1.equalCalculationStage(c2) )
+						if ( passCounter>=1000000 ) {
+							System.err.println("More than 1000000 passes.");
+							return false;
+						} // end if ( passCounter>=1000000 ) 
+					} // end while ( !c1.getCompleted() && !c2.getCompleted() )
+					System.out.println("Completed ["+i+","+j+","+k+"]");
+				} // end j+1 <= k < productSize
+			} // end i+1 <= j < productSize-1
+		} // end for 0 <= i < productSize-2
+		return true;
+	} // end checkSubalgebraSet(SmallAlgebra,int)
+	
 	/**
 	 * Defines what all the CLI commands do
 	 * @return Whether or not to continue execution
@@ -601,6 +635,7 @@ public class Horowitz {
 				e.printStackTrace(System.err);
 			} // end try-catch (FileNotFoundException)
 			Thread runner = new Thread(new JonssonRunner((SmallAlgebra)algs.get(params[0]),rep,numThreads,indices,"jonsson-partial-"+algFiles.get(params[0])+".termmap"));
+			runner.setPriority(Thread.MAX_PRIORITY);
 			reports.add(rep);
 			tasks.add(runner);
 			taskTypes.add("jonsson");
@@ -721,7 +756,17 @@ public class Horowitz {
 	} // end runCLI()
 	
 	public static void main(String[] args) {
-		(new Horowitz()).runCLI();
+		SmallAlgebra alg = null;
+		try {
+			alg = AlgebraIO.readAlgebraFile("resources\\algebras\\n5.ua");
+		} catch ( BadAlgebraFileException e ) {
+			e.printStackTrace();
+		} catch ( IOException f ) {
+			f.printStackTrace();
+		} // end try-catch BadAlgebraFileException, IOException
+		if ( alg!=null ) System.out.println("Result: "+check3GeneratedSubalgebras(alg,1));
+		
+//		(new Horowitz()).runCLI();
 /*		Vector<Operation> ops = new Vector();
 		ops.addAll(makeFlatAlmostJonssonSequence(3,4,new int[] {0,1,0},2));
 		ops.add(makeFlatAlmostJonssonOperation("d21012",3,2,false,new int[] {1,0,1},2));
