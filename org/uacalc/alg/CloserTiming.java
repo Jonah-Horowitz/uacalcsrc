@@ -40,9 +40,9 @@ public class CloserTiming {
   private static final long thirdCount = 60000000;
   private long realInitCount;
   
-  public CloserTiming(BigProductAlgebra algebra, ProgressReport report) {
+  public CloserTiming(Algebra algebra, ProgressReport report) {
     this.report = report;
-    projs = algebra.getNumberOfFactors();
+    projs = (algebra instanceof BigProductAlgebra)?((BigProductAlgebra)algebra).getNumberOfFactors():1;
     final int k = algebra.operations().size();
     arities = new int[k];
     for (int i = 0; i < k; i++) {

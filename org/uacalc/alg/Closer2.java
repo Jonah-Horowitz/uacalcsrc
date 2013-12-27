@@ -1,6 +1,8 @@
 package org.uacalc.alg;
 
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
 
 import org.uacalc.util.*;
 import org.uacalc.terms.*;
@@ -19,6 +21,7 @@ public class Closer2 {
 	public static final Integer MINUS_ONE = new Integer(-1);
 	public static final int SERIAL = 0;
 	public static final int PARALLEL = 1;
+	public static final int EQUAL_WORKLOAD = 2;
 	public static final int PROGRAM_CHOICE = -1;
 	
 	public static int FEEDER_CAPACITY=100000; // Maximum number of chunks the feeder queue can hold
@@ -26,7 +29,7 @@ public class Closer2 {
 	public static int MAX_UNUSED_PASSES=100; // Maximum number of consecutive passes the collector thread can go idle before taking a nap
 	public static int PROCESS_PER_LOOP=1000; // How many partial results the collector thread should process per loop
 	
-	private BigProductAlgebra algebra; // The algebra with respect to which we are closing
+	private Algebra algebra; // The algebra with respect to which we are closing
 	private List<IntArray> ans = null; // Eventually, the subuniverse itself
 	private boolean completed = false; // Whether or not we are done computing
 	private List<IntArray> generators; // The generator list which we will be closing
@@ -51,20 +54,21 @@ public class Closer2 {
 	private int numThreads = 0; // Number of threads to use in calculation (0 = number of cores)
 	private boolean splitFeederThread = false; // Whether or not to separate the data stream from the reducer in parallel mode 
 	private int argumentsPerChunk = 1; // In parallel mode, determines how many arguments are allocated per chunk of data
+	private boolean forceNonPower = false; // if true, does not use the special algorithm for power algebras
 	
 	private boolean stopEachPass=false; // Only used for testing 
 	
-	public Closer2( BigProductAlgebra alg, List<IntArray> gens ) {
+	public Closer2( Algebra alg, List<IntArray> gens ) {
 		algebra = alg;
 		setGenerators(gens);
 	} // end constructor( BigProductAlgebra, List<IntArray> )
 	
-	public Closer2( BigProductAlgebra alg, List<IntArray> gens, Map<IntArray,Term> termMap ) {
+	public Closer2( Algebra alg, List<IntArray> gens, Map<IntArray,Term> termMap ) {
 		this(alg,gens);
 		this.termMap=termMap;
 	} // end constructor(BigProductAlgebra, List<IntArray>, Map<IntArray,Term>)
 	
-	public Closer2( BigProductAlgebra alg, List<IntArray> gens, boolean makeTermMap ) {
+	public Closer2( Algebra alg, List<IntArray> gens, boolean makeTermMap ) {
 		this(alg,gens);
 		if (makeTermMap) setupTermMap();
 	} // end constructor(BigProductAlgebra, List<IntArray>, boolean)
@@ -126,6 +130,7 @@ public class Closer2 {
 	public Closer2 setStopEachPass(boolean val) { stopEachPass=val; return this; }
 	public boolean getStopEachPass() { return stopEachPass; }
 	public boolean getCompleted() { return completed; }
+	public Closer2 setForceNonPower(boolean newVal) { forceNonPower = newVal; return this; }
 	
 	public Closer2 setGenerators(List<IntArray> gens) {
 		if ( gens==null ) return this;
@@ -178,7 +183,7 @@ public class Closer2 {
 	private int pass; // Which pass number we're currently calculating
 	private int numOfOps; // The number of operations in the base algebra
 	private int closedMark=0; // The point in ans to which we have already closed
-	private int currentMark; // The point in ans to which we will close this pass
+	private int currentMark=-1; // The point in ans to which we will close this pass
 	private Operation[] imgOps = null; // Operations in the imageAlgebra
 	private List<int[]> rawList; // The raw list of subuniverse elements
 	private HashSet<IntArray> su; // The set of all subuniverse elements
@@ -197,10 +202,10 @@ public class Closer2 {
 		numOfOps=algebra.operations().size();
 		if ( homomorphism!=null ) {
 			imgOps=new Operation[numOfOps];
-			for ( int i = 0; i < numOfOps; i++ ) imgOps[i]=algebra.operations().get(i);
+			imageAlgebra.makeOperationTables();
+			for ( int i = 0; i < numOfOps; i++ ) imgOps[i]=imageAlgebra.getOperation(algebra.operations().get(i).symbol());
 			imgAlgSize=imageAlgebra.cardinality();
 			imgOpTables = new int[numOfOps][];
-			imageAlgebra.makeOperationTables();
 			for ( int i = 0; i < numOfOps; i++ ) {
 				Operation op = imageAlgebra.getOperation(algebra.operations().get(i).symbol());
 				if ( op instanceof OperationWithDefaultValue ) {
@@ -232,14 +237,24 @@ public class Closer2 {
 			rawList.add(ia.getArray());
 		} // end for ( IntArray ia : generators )
 		su = new HashSet<IntArray>(ans);
-		final List<IntArray> constants = algebra.getConstants();
+		for ( Operation op : ops ) {
+			if ( op.arity()==0 ) {
+				IntArray ia = (IntArray)op.valueAt(new ArrayList<IntArray>());
+				if (su.add(ia)) {
+					ans.add(ia);
+					rawList.add(ia.getArray());
+					if (termMap!=null) termMap.put(ia, NonVariableTerm.makeConstantTerm(op.symbol()));
+				} // end if (su.add(ia))
+			} // end if (op.arity()==0)
+		} // end for ( Operation op : ops )
+/*		final List<IntArray> constants = algebra.getConstants();
 		for ( IntArray arr : constants ) {
 			if (su.add(arr)) {
 				ans.add(arr);
 				rawList.add(arr.getArray());
 				if (termMap!=null) termMap.put(arr, NonVariableTerm.makeConstantTerm(algebra.constantToSymbol.get(arr)));
 			} // end if (su.add(arr))
-		} // end for ( IntArray arr : constants )
+		} // end for ( IntArray arr : constants )/**/
 		currentMark=ans.size();
 		if (report!=null) timing = new CloserTiming(algebra, report);
 	} // end initializeClosure()
@@ -252,10 +267,10 @@ public class Closer2 {
 	} // end sgClose(List<IntArray>, int, Map<IntArray,Term>)
 	
 	public List<IntArray> sgClose() {
-		if ( algebra.isPower() ) {
-			algebra.rootFactors().get(0).makeOperationTables();
+		if ( !forceNonPower && (algebra instanceof BigProductAlgebra) && ((BigProductAlgebra)algebra).isPower() ) {
+			((BigProductAlgebra)algebra).rootFactors().get(0).makeOperationTables();
 			return sgClosePower();
-		} // end if ( algebra.isPower() )
+		} // end if ( algebra.isPower() )	
 		
 		if (pass==0) initializeClosure();
 		
@@ -272,6 +287,7 @@ public class Closer2 {
 			switch (currentPassType()) {
 				case SERIAL: result = onePassSerial(); break;
 				case PARALLEL: result = onePassParallel(); break;
+				case EQUAL_WORKLOAD: result = onePassEqualWorkload(); break;
 			} // end switch (currentPassType())
 			if (!result) return completed?ans:null;
 			closedMark=currentMark;
@@ -283,7 +299,7 @@ public class Closer2 {
 			if (stopEachPass) break;
 		} // end while ( closedMark<currentMark )
 		if ( closedMark>=currentMark ) completed=true;
-		return ans;
+		return ans;/**/
 	} // end sgClose()
 	
 	/**
@@ -291,8 +307,8 @@ public class Closer2 {
 	 */
 	public int currentPassType() {
 		if ( passDecisionProcedure!=PROGRAM_CHOICE ) return passDecisionProcedure;
-		if ( numThreads==0 ) numThreads=Runtime.getRuntime().availableProcessors();
-		if ( numThreads==1 ) return SERIAL;
+		int nt = numThreads==0?Runtime.getRuntime().availableProcessors():numThreads;		
+		if ( nt==1 ) return SERIAL;
 		return PARALLEL;
 	} // end currentPassType()
 	
@@ -431,8 +447,10 @@ public class Closer2 {
 			prevHomomorphism = new HashMap<IntArray,Integer>();
 			prevHomomorphism.putAll(homomorphism);
 		} // end if ( imgOps!=null )
+		final List<ReentrantLock> opLocks = new ArrayList<ReentrantLock>();
+		for ( int i = 0; i < ops.size(); i++ ) opLocks.add(new ReentrantLock());
 		for ( int i = 0; i < numWorkers; i++ ) {
-			workers[i]=new SGCloseThread(feeder,opTables,arities,argumentsPerChunk,closedMark,currentMark,prevRawList,ops,prevTermMap,symbols,collector,i,imgOpTables,prevHomomorphism,imgAlgSize);
+			workers[i]=new SGCloseThread(feeder,opTables,arities,argumentsPerChunk,closedMark,currentMark,prevRawList,ops,prevTermMap,symbols,collector,i,imgOpTables,prevHomomorphism,imgAlgSize,opLocks);
 			workers[i].setPriority(THREAD_PRIORITY);
 			workersFinished[i]=false;
 			workers[i].start();
@@ -493,7 +511,7 @@ public class Closer2 {
 			for ( int q = 0; q < PROCESS_PER_LOOP; q++ ) {
 				if (collector.size()==0) break;
 				partResult=collector.poll();
-				if ( partResult!=null && partResult.completed>0 ) {
+				if ( partResult!=null && partResult.completed>=0 ) {
 					workersFinished[partResult.completed]=true;
 				} else if ( partResult!=null ) {
 					chunksProcessedThisPass++;
@@ -627,10 +645,194 @@ public class Closer2 {
 		return true;
 	} // end onePassParallel()
 
+	public boolean onePassEqualWorkload() {
+		final boolean imgAlgNull = imgOps==null;
+		final boolean eltToFindNotNull = eltToFind!=null;
+		final boolean eltsToFindNotNull = eltsToFind!=null;
+		final boolean operationsNotNull = operations!=null;
+		final boolean termMapNotNull = termMap!=null;
+
+		final int numWorkers = numThreads==0?Runtime.getRuntime().availableProcessors():numThreads;
+		final Set<IntArray> suTemp = Collections.newSetFromMap(new ConcurrentHashMap<IntArray,Boolean>());
+		suTemp.addAll(su);
+		final ReadWriteLock ansLock = new ReentrantReadWriteLock();
+		final ReadWriteLock rawListLock = new ReentrantReadWriteLock();
+		final Map<IntArray,Term> termMapTemp = termMap==null?null:new ConcurrentHashMap<IntArray,Term>(termMap);
+		final Map<Operation,Term> termMapForOperationsTemp = termMapForOperations==null?null:new ConcurrentHashMap<Operation,Term>(termMapForOperations);
+		final ReadWriteLock operationsFoundLock = new ReentrantReadWriteLock();
+		final Map<IntArray,Integer> indicesMapOfFoundEltsTemp = indicesMapOfFoundElts==null?null:new ConcurrentHashMap<IntArray,Integer>(indicesMapOfFoundElts);
+		final ReadWriteLock specialEltsFoundLock = new ReentrantReadWriteLock();
+		final Map<IntArray,Integer> homomorphismTemp = homomorphism==null?null:new ConcurrentHashMap<IntArray,Integer>(homomorphism);
+		final List<ReentrantLock> opLocks = new ArrayList<ReentrantLock>();
+		for ( int i = 0; i < ops.size(); i++ ) opLocks.add(new ReentrantLock());
+		
+		class SGCloseTask implements Runnable {
+			private int index;
+			public boolean finished = false;
+			
+			public SGCloseTask( int newIndex ) {
+				index = newIndex;
+			} // end constructor(int)
+			
+			@Override
+			public void run() {
+				for ( int i = 0; i < ops.size(); i++ ) {
+					Operation f = ops.get(i);
+					ReentrantLock opLock = opLocks.get(i);
+					int arity = f.arity();
+					if (arity==0) continue;
+					int[] argIndices = new int[arity];
+					for ( int j = 0; j < arity-1; j++ ) argIndices[j]=0;
+					argIndices[arity-1]=index-numWorkers;
+					ArrayIncrementor inc = SequenceGenerator.blockSequenceIncrementor(argIndices, currentMark-1, closedMark, numWorkers);
+					final int[][] arg = new int[arity][];
+					while (inc.increment()) {
+						if (Thread.currentThread().isInterrupted()) return;
+						rawListLock.readLock().lock();
+						for ( int j = 0; j < arity; j++ ) arg[j] = rawList.get(argIndices[j]);
+						rawListLock.readLock().unlock();
+						opLock.lock();
+						int[] vRaw = f.valueAt(arg);
+						opLock.unlock();
+						IntArray v = new IntArray(vRaw);
+						if (suTemp.add(v)) {
+							ansLock.writeLock().lock();
+							ans.add(v);
+							ansLock.writeLock().unlock();
+							rawListLock.writeLock().lock();
+							rawList.add(vRaw);
+							rawListLock.writeLock().unlock();
+							if ( termMapNotNull ) {
+								List<Term> children = new ArrayList<Term>(arity);
+								ansLock.readLock().lock();
+								for ( int j = 0; j < arity; j++ ) children.add(termMapTemp.get(ans.get(argIndices[j])));
+								ansLock.readLock().unlock();
+								termMapTemp.put(v, new NonVariableTerm(f.symbol(), children));
+								if (operationsNotNull) {
+									Term term = termMapTemp.get(v);
+									List<Variable> vars = new ArrayList<Variable>(generators.size());
+									for ( IntArray ia : generators ) vars.add((Variable)termMapTemp.get(ia));
+									Operation termOp = term.interpretation(rootAlgebra, vars, true);
+									for ( Operation op : operations ) {
+										if ( termMapForOperationsTemp.containsKey(op) && Operations.equalValues(termOp, op) ) {
+											termMapForOperationsTemp.put(op, term);
+											operationsFoundLock.writeLock().lock();
+											operationsFound++;
+											operationsFoundLock.writeLock().unlock();
+											operationsFoundLock.readLock().lock();
+											if ( operationsFound==operations.size() ) {
+												operationsFoundLock.readLock().unlock();
+												completed=true;
+												finished=true;
+												return;
+											} else {
+												operationsFoundLock.readLock().unlock();
+											} // end if-else ( operationsFound==operations.size() )											
+										} // end if ( termMapForOperationsTemp.containsKey(op) && Operations.equalValues(termOp, op) )
+									} // end for ( Operation op : operations )
+								} // end if (operationsNotNull)								
+							} // end if (termMapNotNull)
+							if (eltToFindNotNull && v.equals(eltToFind)) {
+								completed=true;
+								finished=true;
+								return;
+							} // end if (eltToFindNotNull && v.equals(eltToFind))
+							if ( eltsToFindNotNull && MINUS_ONE.equals(indicesMapOfFoundEltsTemp.get(v)) ) {
+								ansLock.readLock().lock();
+								final int index = ans.size()-1;
+								ansLock.readLock().unlock();
+								indicesMapOfFoundEltsTemp.put(v, index);
+								specialEltsFoundLock.writeLock().lock();
+								specialEltsFound++;
+								specialEltsFoundLock.writeLock().unlock();
+								specialEltsFoundLock.readLock().lock();
+								if ( specialEltsFound==eltsToFind.size() ) {
+									specialEltsFoundLock.readLock().unlock();
+									allEltsFound=true;
+									completed=true;
+									finished=true;
+									return;
+								} else {
+									specialEltsFoundLock.readLock().unlock();
+								} // end if-else ( specialEltsFound==eltsToFind.size() )
+							} // end if ( eltsToFindNotNull && MINUS_ONE.equals(indicesMapOfFoundElts.get(v)) )
+							if (imgAlgNull) {
+								ansLock.readLock().lock();
+								if ( algebra.cardinality()>0 && ans.size()==algebra.cardinality() ) {
+									ansLock.readLock().unlock();
+									completed=true;
+									finished=true;
+									return;
+								} else {
+									ansLock.readLock().unlock();
+								} // end if ( algebra.cardinality()>0 && ans.size()==algebra.cardinality() )
+							} else {
+								final int[] args = new int[arity];
+								ansLock.readLock().lock();
+								for ( int t = 0; t < arity; t++ ) args[t]=homomorphismTemp.get(ans.get(argIndices[t]));
+								ansLock.readLock().unlock();
+								homomorphismTemp.put(v, imgOps[i].intValueAt(args));
+							} // end if-else (imgAlgNull)
+						} else {
+							if ( imgOps!=null ) {
+								final int[] args=new int[arity];
+								ansLock.readLock().lock();
+								for ( int t = 0; t < arity; t++ ) args[t]=homomorphismTemp.get(ans.get(argIndices[t]));
+								ansLock.readLock().unlock();
+								if ( homomorphismTemp.get(v).intValue() != imgOps[i].intValueAt(args) ) {
+									List<Term> children = new ArrayList<Term>(arity);
+									for ( int r = 0; r < arity; r++ ) children.add(termMapTemp.get(ans.get(argIndices[r])));
+									failingEquation = new Equation( termMapTemp.get(v), new NonVariableTerm(imgOps[i].symbol(),children) );
+									finished=true;
+									completed=true;
+									return;
+								} // end if ( homomorphism.get(v).intValue() != imgOps.get(i).intValueAt(args) )
+							} // end if ( imgOps!=null )
+							
+						} // end if-else (suTemp.add(v))
+						
+					} // end while (inc.increment())
+				} // end for ( Operation f : ops )	
+				finished=true;
+			} // end run()
+		} // end class SGCloseTask
+
+		SGCloseTask[] work = new SGCloseTask[numWorkers];
+		Thread[] workers = new Thread[numWorkers];
+		for ( int i = 0; i < numWorkers; i++ ) {
+			work[i]=new SGCloseTask(i);
+			workers[i]=new Thread(work[i]);
+		}
+		for ( int i = 1; i < numWorkers; i++ ) workers[i].start();
+		work[0].run();
+		for ( int i = 0; i < numWorkers; i++ ) {
+			if (!work[i].finished) {
+				for ( int j = i+1; j < numWorkers; j++ ) if (workers[j].isAlive()) workers[j].interrupt();
+				break;
+			} // end if (!work[i].finished)
+			if (i<numWorkers-1 && workers[i+1].isAlive()) try {
+				workers[i+1].join();
+			} catch ( InterruptedException e ) {				
+			} // end try-catch InterruptedException
+		} // end for 0 <= i < numWorkers
+		
+		su.addAll(suTemp);
+		if (termMap!=null) termMap.putAll(termMapTemp);
+		if (termMapForOperations!=null) termMapForOperations.putAll(termMapForOperationsTemp);
+		if (indicesMapOfFoundElts!=null) indicesMapOfFoundElts.putAll(indicesMapOfFoundEltsTemp);
+		if (homomorphism!=null) homomorphism.putAll(homomorphismTemp);
+		
+		if ( completed ) return false;
+		boolean notDone = true;
+		for ( int i = 0; i < numWorkers; i++ ) if (!work[i].finished) notDone=false;
+		return notDone;
+	} // end onePassEqualWorkload()
+	
 	private void initializeClosurePower() {
 		if ( report!=null ) report.addStartLine("subpower closing...");
-		algSize = algebra.factors().get(0).cardinality();
-		ops = algebra.factors().get(0).operations();
+		BigProductAlgebra bpa = (BigProductAlgebra)algebra;
+		algSize = bpa.factors().get(0).cardinality();
+		ops = bpa.factors().get(0).operations();
 		numOfOps = ops.size();
 		opTables = new int[numOfOps][];
 		symbols = new OperationSymbol[numOfOps];
@@ -662,19 +864,29 @@ public class Closer2 {
 		} // end for 0 <= i < numOfOps
 		if ( operations!=null ) termMapForOperations = new HashMap<Operation,Term>();
 		operationsFound=0;
-		power=algebra.getNumberOfFactors();
+		power=bpa.getNumberOfFactors();
 		if ( ans==null || ans.size()==0 ) ans=new ArrayList<IntArray>(generators);
 		rawList = new ArrayList<int[]>();
 		for ( IntArray arr : ans ) rawList.add(arr.getArray());
 		su = new HashSet<IntArray>(ans);
-		final List<IntArray> constants = algebra.getConstants();
+		for ( Operation op : bpa.operations() ) {
+			if ( op.arity()==0 ) {
+				IntArray ia = (IntArray)op.valueAt(new ArrayList<IntArray>());
+				if ( su.add(ia) ) {
+					ans.add(ia);
+					rawList.add(ia.getArray());
+					if (termMap!=null) termMap.put(ia, NonVariableTerm.makeConstantTerm(op.symbol()));
+				} // end if ( su.add(ia) )
+			} // end if ( op.arity()==0 )
+		} // end for ( Operation op : ops )
+/*		final List<IntArray> constants = algebra.getConstants();
 		for ( IntArray arr : constants ) {
 			if (su.add(arr)) {
 				ans.add(arr);
 				rawList.add(arr.getArray());
 				if (termMap!=null) termMap.put(arr, NonVariableTerm.makeConstantTerm(algebra.constantToSymbol.get(arr)));
 			} // end if (su.add(arr))
-		} // end for ( IntArray arr : constants )
+		} // end for ( IntArray arr : constants ) /**/
 		currentMark = ans.size();
 		pass=0;
 		timing=(report!=null)?new CloserTiming(algebra,report):null;		
@@ -695,6 +907,7 @@ public class Closer2 {
 			switch (currentPassType()) {
 				case SERIAL: result = onePassPowerSerial(); break;
 				case PARALLEL: result = onePassPowerParallel(); break;
+				case EQUAL_WORKLOAD: result = onePassPowerEqualWorkload(); break;
 			} // end switch (currentPassType())
 			if (!result) return completed?ans:null;
 			closedMark=currentMark;
@@ -1112,6 +1325,212 @@ public class Closer2 {
 		return true;
 	} // end onePassPowerParallel()
 	
+	public boolean onePassPowerEqualWorkload() {
+		final boolean imgAlgNull = imgOps==null;
+		final boolean eltToFindNotNull = eltToFind!=null;
+		final boolean eltsToFindNotNull = eltsToFind!=null;
+		final boolean operationsNotNull = operations!=null;
+		final boolean blocksNotNull = blocks!=null;
+		final boolean valuesNotNull = values!=null;
+		final boolean termMapNotNull = termMap!=null;
+		
+		final int numWorkers = numThreads==0?Runtime.getRuntime().availableProcessors():numThreads;
+		final ReadWriteLock rawListLock = new ReentrantReadWriteLock();
+		final Set<IntArray> suTemp = Collections.newSetFromMap(new ConcurrentHashMap<IntArray,Boolean>());
+		suTemp.addAll(su);
+		final ReadWriteLock ansLock = new ReentrantReadWriteLock();
+		final Map<IntArray,Term> termMapTemp = termMap==null?null:new ConcurrentHashMap<IntArray,Term>(termMap);
+		final Map<Operation,Term> termMapForOperationsTemp = termMapForOperations==null?null:new ConcurrentHashMap<Operation,Term>(termMapForOperations);
+		final ReadWriteLock operationsFoundLock = new ReentrantReadWriteLock();
+		final Map<IntArray,Integer> indicesMapOfFoundEltsTemp = indicesMapOfFoundElts==null?null:new ConcurrentHashMap<IntArray,Integer>(indicesMapOfFoundElts);
+		final ReadWriteLock specialEltsFoundLock = new ReentrantReadWriteLock();
+		final Map<IntArray,Integer> homomorphismTemp = homomorphism==null?null:new ConcurrentHashMap<IntArray,Integer>(homomorphism);
+		
+		class SGClosePowerTask implements Runnable {
+			private int index;
+			public boolean finished = false;
+			
+			public SGClosePowerTask(int newIndex) {
+				index=newIndex;
+			} // end constructor(int)
+			
+			public void run() {
+				for ( int i = 0; i < numOfOps; i++ ) {
+					final int arity=arities[i];
+					if (arity==0) continue;
+					int[] opTable = opTables[i];
+					final int[] argIndices = new int[arity];
+					for ( int j = 0; j < arity-1; j++ ) argIndices[j]=0;
+					argIndices[arity-1]=index-numWorkers;
+					ArrayIncrementor inc = SequenceGenerator.blockSequenceIncrementor(argIndices, currentMark-1, closedMark, numWorkers);
+					
+					while (inc.increment()) {
+						if (Thread.currentThread().isInterrupted()) return;
+						int[] vRaw = new int[power];
+						if (opTable!=null) {
+							for ( int j = 0; j < power; j++ ) {
+								int factor=algSize;
+								rawListLock.readLock().lock();
+								int index = rawList.get(argIndices[0])[j];
+								for ( int r = 1; r < arity; r++ ) {
+									index+=factor*rawList.get(argIndices[r])[j];
+									factor=factor*algSize;
+								} // end for 1 <= r < arity 
+								rawListLock.readLock().unlock();
+								vRaw[j]=opTable[index];
+							} // end for 0 <= j < power
+						} else {
+							Operation f = ops.get(i);
+							for ( int j = 0; j < power; j++ ) {
+								final int[] arg = new int[f.arity()];
+								for ( int r = 0; r < arity; r++ ) arg[r]=rawList.get(argIndices[r])[j];
+								vRaw[j]=f.intValueAt(arg);								
+							} // end for 0 <= j < power
+						} // end if-else (optable!=null)
+						IntArray v = new IntArray(vRaw);
+						if (suTemp.add(v)) {
+							ansLock.writeLock().lock();
+							ans.add(v);
+							ansLock.writeLock().unlock();
+							rawListLock.writeLock().lock();
+							rawList.add(vRaw);
+							rawListLock.writeLock().unlock();
+							if (termMapNotNull) {
+								List<Term> children = new ArrayList<Term>(arity);
+								ansLock.readLock().lock();
+								for ( int r = 0; r < arity; r++ ) children.add(termMapTemp.get(ans.get(argIndices[r])));
+								ansLock.readLock().unlock();
+								termMapTemp.put(v, new NonVariableTerm(symbols[i],children));
+								if (operationsNotNull) {
+									Term term = termMapTemp.get(v);
+									List<Variable> vars = new ArrayList<Variable>(generators.size());
+									for ( IntArray ia : generators ) vars.add((Variable)termMapTemp.get(ia));
+									Operation termOp = term.interpretation(rootAlgebra, vars, true);
+									for ( Operation op : operations ) {
+										if ( Operations.equalValues(termOp, op) ) {
+											termMapForOperationsTemp.put(op, term);
+											operationsFoundLock.writeLock().lock();
+											operationsFound++;
+											operationsFoundLock.writeLock().unlock();
+											operationsFoundLock.readLock().lock();
+											if ( operationsFound==operations.size() ) {
+												operationsFoundLock.readLock().unlock();
+												completed=true;
+												finished=true;
+												return;
+											} else {
+												operationsFoundLock.readLock().unlock();
+											} // end if-else ( operationsFound==operations.size() )
+										} // end if ( Operations.equalValues(termOp, op) )
+									} // end for ( Operation op : operations )
+								} // end if (operationsNotNull)
+							} // end if (termMapNotNull)
+							if ( eltToFindNotNull && v.equals(eltToFind) ) {
+								completed=true;
+								finished=true;
+								return;
+							} // end if ( eltToFindNotNull && v.equals(eltToFind) )
+							if ( eltsToFindNotNull && MINUS_ONE.equals(indicesMapOfFoundEltsTemp.get(v)) ) {
+								final int index = ans.size()-1;
+								indicesMapOfFoundEltsTemp.put(v, index);
+								specialEltsFoundLock.writeLock().lock();
+								specialEltsFound++;
+								specialEltsFoundLock.writeLock().unlock();
+								specialEltsFoundLock.readLock().unlock();
+								if (specialEltsFound==eltsToFind.size()) {
+									specialEltsFoundLock.readLock().unlock();
+									allEltsFound=true;
+									completed=true;
+									finished=true;
+									return;
+								} else {
+									specialEltsFoundLock.readLock().unlock();
+								} // end if-else (specialEltsFound==eltsToFind.size())
+							} // end if ( eltsToFindNotNull && MINUS_ONE.equals(indicesMapOfFoundElts.get(v)) )
+							if (blocksNotNull) {
+								boolean found = false;
+								if (valuesNotNull) {
+									if (v.satisfiesConstraint(blocks, values)) found=true;
+								} else {
+									if (v.satisfiesConstraint(blocks)) found=true;
+								} // end if-else (valuesNotNull)
+								if (found) {
+									eltToFind=v;
+									completed=true;
+									finished=true;
+									return;
+								} // end if (found)
+							} // end if (blocksNotNull)
+							
+							if (imgOps==null) {
+								final int size = ans.size();
+								if ( imgAlgNull && algebra.cardinality()>0 && size==algebra.cardinality() ) {
+									completed=true;
+									finished=true;
+									return;
+								} // end if (imgAlgNull && algebra.cardinality()>0 && size==algebra.cardinality() )
+							} else {
+								final int[] args = new int[arity];
+								ansLock.readLock().lock();
+								for ( int t = 0; t < arity; t++ ) args[t]=homomorphismTemp.get(ans.get(argIndices[t]));
+								ansLock.readLock().unlock();
+								homomorphismTemp.put(v, imgOps[i].intValueAt(args));
+							} // end if-else (imgOps==null)
+						} else {
+							if (!imgAlgNull) {
+								final int[] args = new int[arity];
+								ansLock.readLock().lock();
+								for ( int t = 0; t < arity; t++ ) args[t] = homomorphismTemp.get(ans.get(argIndices[t]));
+								ansLock.readLock().unlock();
+								if ( homomorphismTemp.get(v).intValue() != imgOps[i].intValueAt(args) ) {
+									List<Term> children = new ArrayList<Term>(arity);
+									for ( int r = 0; r < arity; r++ ) children.add(termMapTemp.get(argIndices[r]));
+									failingEquation = new Equation(termMapTemp.get(v), new NonVariableTerm(symbols[i],children));
+									completed=true;
+									finished=true;
+									return;
+								} // end if ( homomorphism.get(v).intValue() != imgOps[i].intValueAt(args) )
+							} // end if (imgAlgNull)
+						} // end if-else (su.add(v))
+						
+					} // end while (int.increment())
+				} // end for 0 <= i < numOfOps
+				finished=true;
+			} // end run()
+			
+		} // end class SGClosePowerTask
+		
+		SGClosePowerTask[] work = new SGClosePowerTask[numWorkers];
+		Thread[] workers = new Thread[numWorkers];
+		for ( int i = 0; i < numWorkers; i++ ) {
+			work[i]=new SGClosePowerTask(i);
+			workers[i]=new Thread(work[i]);
+		}
+		for ( int i = 1; i < numWorkers; i++ ) workers[i].start();
+		workers[0].run();
+		for ( int i = 0; i < numWorkers; i++ ) {
+			if (!work[i].finished) {
+				for ( int j = i+1; j < numWorkers; j++ ) if (workers[j].isAlive()) workers[j].interrupt();
+				break;
+			} // end if (!work[i].finished)
+			if (i<numWorkers-1 && workers[i+1].isAlive()) try {
+				workers[i+1].join();
+			} catch ( InterruptedException e ) {				
+			} // end try-catch InterruptedException
+		} // end for 0 <= i < numWorkers
+		
+		su.addAll(suTemp);
+		if (termMap!=null) termMap.putAll(termMapTemp);
+		if (termMapForOperations!=null) termMapForOperations.putAll(termMapForOperationsTemp);
+		if (indicesMapOfFoundElts!=null) indicesMapOfFoundElts.putAll(indicesMapOfFoundEltsTemp);
+		if (homomorphism!=null) homomorphism.putAll(homomorphismTemp);
+		
+		if ( completed ) return false;
+		boolean notDone = true;
+		for ( int i = 0; i < numWorkers; i++ ) if (!work[i].finished) notDone=false;
+		return notDone;
+	} // end onePassPowerEqualWorkload()
+	
 	private void killThreads(Thread[] workers, Thread feeder) {
 		if (feeder!=null && feeder.isAlive()) {
 			try {
@@ -1161,7 +1580,7 @@ public class Closer2 {
 			} // end for ( IntArray ia : ans )
 		if ((homomorphism!=null && !homomorphism.equals(target.getHomomorphism()))||(homomorphism==null&&target.getHomomorphism()!=null)) return false;
 		return true;
-	} // end equalCalculationStage(Closer2)
+	} // end equalCalculationStage(Closer2)/**/
 
 	/**
 	 * This class fills the feeder <code>java.util.concurrent.BlockingQueue</code> in a separate Thread
@@ -1188,7 +1607,7 @@ public class Closer2 {
 			arity=arities[opIndex];
 			while ( arity==0 && opIndex<numOfOps ) {
 				opIndex++;
-				arity=arities[opIndex];
+				if (opIndex<numOfOps) arity=arities[opIndex];
 			} // end while ( arity==0 && opIndex<numOfOps )
 			int[] tempSegment = new int[arity<=argumentsPerChunk?0:arity-argumentsPerChunk];
 			for ( int i = 0; i < tempSegment.length; i++ ) tempSegment[i]=0;

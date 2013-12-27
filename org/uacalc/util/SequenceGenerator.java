@@ -187,6 +187,30 @@ public final class SequenceGenerator {
       };
   }
 
+  public static ArrayIncrementor blockSequenceIncrementor( final int[] a, final int max, final int min, final int jump ) {
+	  return new ArrayIncrementor() {
+		  public boolean increment() {
+			  boolean ans=incrementAux();
+			  while (!anyOver()) ans=incrementAux();
+			  return ans;
+		  } // end increment()
+		  
+		  public boolean anyOver() {
+			  for ( int i = 0; i < a.length; i++ ) if ( a[i]>=min ) return true;
+			  return false;
+		  } // end anyOver()
+		  
+		  public boolean incrementAux() {
+			  a[a.length-1]+=jump;
+			  for ( int i = a.length-1; i>0; i-- ) while (a[i]>max) {
+				  a[i]-=max;
+				  a[i-1]++;
+			  } // end while (a[i]>max)
+			  return a[0]<=max;
+		  } // end incrementAux()
+	  };
+  } // end blockSequenceIncrementor(int[], int, int, int)
+  
   /**
    * This just increments the array through all possible tuples
    * with entries between 0 and max from the left. This increments 

@@ -438,7 +438,7 @@ public class Horowitz {
 		} // end switch (taskTypes.get(i))
 	} // end checkOn(int)
 	
-	private static boolean check3GeneratedSubalgebras(SmallAlgebra alg, int power) {
+	public static boolean check3GeneratedSubalgebras(SmallAlgebra alg, int power) {
 		SmallProductAlgebra bpa = new SmallProductAlgebra(alg, power);
 		int algSize = alg.cardinality();
 		int productSize = bpa.cardinality();
@@ -755,8 +755,286 @@ public class Horowitz {
 		} // end while ( keepGoing )
 	} // end runCLI()
 	
-	public static void main(String[] args) {
+	private static long calculateCloserTiming(Closer2 c) {
+		long startTime = System.currentTimeMillis();
+		c.sgClose();
+		return System.currentTimeMillis()-startTime;
+	} // end calculateCloserTiming(Closer2,BufferedWriter)
+	
+	private static class IncorrectAnswerException extends Exception {
+		private static final long serialVersionUID=62;
+		
+		public IncorrectAnswerException(String message) {
+			super(message);
+		} // end constructor(String)
+	} // end class IncorrectAnswerException
+	
+	/**
+	 * Calculates a subuniverse several different ways and records the amount of time taken.
+	 * @param alg  The algebra
+	 * @param gens  The generators of the subuniverse
+	 * @param makeTermMap  Whether or not to make the term map
+	 * @param output  The file to which the times taken should be written
+	 */
+	public static void subalgebraTiming(Algebra alg, List<IntArray> gens, boolean makeTermMap, File output) throws IOException, IncorrectAnswerException {
+		Set<IntArray> prev = null;
+		long initialTime = -1;
+		long startTime;
+		if ( alg instanceof BigProductAlgebra )	{
+			Closer prev2 = new Closer((BigProductAlgebra)alg,gens,makeTermMap);
+			startTime = System.currentTimeMillis();
+			prev = new HashSet<IntArray>(prev2.sgClose());
+			initialTime = System.currentTimeMillis()-startTime;
+		} // end if ( alg instanceof BigProductAlgebra )		
+		int numCPUs = Runtime.getRuntime().availableProcessors();
+		Closer2[] parallel = new Closer2[2*numCPUs];
+		parallel[0] = new Closer2(alg,gens,makeTermMap).setPassDecisionProcedure(Closer2.SERIAL).setStopEachPass(true);
+		for ( int i = 1; i < parallel.length; i++ ) parallel[i] = new Closer2(alg,gens,makeTermMap).setPassDecisionProcedure(Closer2.PARALLEL).setNumThreads(i+1).setStopEachPass(true);
+		Closer2[] ewl = new Closer2[2*numCPUs];
+		for ( int i = 0; i < ewl.length; i++ ) ewl[i] = new Closer2(alg,gens,makeTermMap).setPassDecisionProcedure(Closer2.EQUAL_WORKLOAD).setNumThreads(i+1).setStopEachPass(true);
+		Closer2[] parallelNP = new Closer2[parallel.length];
+		parallelNP[0] = new Closer2(alg,gens,makeTermMap).setPassDecisionProcedure(Closer2.SERIAL).setStopEachPass(true).setForceNonPower(true);
+		for ( int i = 1; i < parallelNP.length; i++ ) parallelNP[i] = new Closer2(alg,gens,makeTermMap).setPassDecisionProcedure(Closer2.PARALLEL).setNumThreads(i+1).setStopEachPass(true).setForceNonPower(true);
+		Closer2[] ewlNP = new Closer2[ewl.length];
+		for ( int i = 0; i < ewlNP.length; i++ ) ewlNP[i] = new Closer2(alg,gens,makeTermMap).setPassDecisionProcedure(Closer2.EQUAL_WORKLOAD).setNumThreads(i+1).setStopEachPass(true).setForceNonPower(true);/**/
+		if (!output.exists()) output.createNewFile();
+		BufferedWriter out = new BufferedWriter(new FileWriter(output));
+		out.write("Algebra name: "+alg.getName()+"\nNumber of Cores:;"+numCPUs+"\nSubuniverse Generators:");
+		for ( IntArray ia : gens ) out.write(";"+ia.toString());
+		String headers = "\nBaseline time;"+initialTime+"\nType;Threads";
+		String passSizes = "Pass Sizes:";
+		int pass = 0;
+		String ans = "Serial;1";
+		while (!parallel[0].getCompleted()) {
+			System.out.println("Calculating "+alg.getName()+", type serial, pass "+parallel[0].getPass());
+			headers=headers+";"+pass;
+			passSizes = passSizes+";"+(parallel[0].getAnswer()==null?gens.size():parallel[0].getAnswer().size());
+			ans=ans+";"+calculateCloserTiming(parallel[0]);
+		} // end while (!parallel[0].getCompleted())
+		if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallel[0].getAnswer())) ) {
+			String blah = "Error calculating "+alg.getName()+", type serial: Result mismatch.";
+			System.err.println(blah);
+			out.close();
+			throw new IncorrectAnswerException(blah);
+		} // end if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallel[0].getAnswer())) )
+		out.write(passSizes+"\n"+headers+"\n"+ans+"\n");
+		ans = "Serial-NP;1";
+		while (!parallelNP[0].getCompleted()) {
+			System.out.println("Calculating "+alg.getName()+", type serialNP, pass "+parallelNP[0].getPass());
+			ans=ans+";"+calculateCloserTiming(parallelNP[0]);
+		} // end while (!parallelNP[0].getCompleted())
+		if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallelNP[0].getAnswer())) ) {
+			String blah="Error calculating "+alg.getName()+", type serialNP: Result mismatch.";
+			System.err.println(blah);
+			out.close();
+			throw new IncorrectAnswerException(blah);
+		} // end if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallel[0].getAnswer())) )/**/
+		out.write(ans+"\n");
+		for ( int i = 1; i < parallel.length; i++ ) {
+			ans="Parallel;"+(i+1);
+			while (!parallel[i].getCompleted()) {
+				System.out.println("Calculating "+alg.getName()+", type parallel ("+(i+1)+"), pass "+parallel[i].getPass());
+				ans=ans+";"+calculateCloserTiming(parallel[i]);
+			} // end while (!parallel[i].getCompleted())
+			if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallel[i].getAnswer())) ) {
+				String blah="Error calculating "+alg.getName()+", type parallel ("+(i+1)+"): Result mismatch.";
+				System.err.println(blah);
+				out.close();
+				throw new IncorrectAnswerException(blah);
+			} // end if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallel[0].getAnswer())) )
+			out.write(ans+"\n");
+		} // end for 1 <= i < parallel.length
+		for ( int i = 1; i < parallelNP.length; i++ ) {
+			ans="Parallel-NP;"+(i+1);
+			while (!parallelNP[i].getCompleted()) {
+				System.out.println("Calculating "+alg.getName()+", type parallelNP ("+(i+1)+"), pass "+parallelNP[i].getPass());
+				ans=ans+";"+calculateCloserTiming(parallelNP[i]);
+			} // end while (!parallel[i].getCompleted())
+			if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallelNP[i].getAnswer())) ) {
+				String blah="Error calculating "+alg.getName()+", type parallelNP ("+(i+1)+"): Result mismatch.";
+				System.err.println(blah);
+				out.close();
+				throw new IncorrectAnswerException(blah);
+			} // end if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallel[0].getAnswer())) )
+			out.write(ans+"\n");
+		} // end for 1 <= i < parallel.length/**/
+		for ( int i = 0; i < ewl.length; i++ ) {
+			ans="EWL;"+(i+1);
+			while (!ewl[i].getCompleted()) {		
+				System.out.println("Calculating "+alg.getName()+", type EWL ("+(i+1)+"), pass "+ewl[i].getPass());
+				ans=ans+";"+calculateCloserTiming(ewl[i]);
+			} // end while (!ewl[i].getCompleted())
+			out.write(ans+"\n");
+			if ( prev!=null && !prev.equals(new HashSet<IntArray>(ewl[i].getAnswer())) ) {
+				String blah="Error calculating "+alg.getName()+", type EWL ("+(i+1)+"): Result mismatch.";
+				System.err.println(blah);
+				out.close();
+				throw new IncorrectAnswerException(blah);
+			} // end if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallel[0].getAnswer())) )
+		} // end for 0 <= i < ewl.length
+		for ( int i = 0; i < ewlNP.length; i++ ) {
+			ans="EWL-NP;"+(i+1);
+			while (!ewlNP[i].getCompleted()) {		
+				System.out.println("Calculating "+alg.getName()+", type EWLNP ("+(i+1)+"), pass "+ewlNP[i].getPass());
+				ans=ans+";"+calculateCloserTiming(ewlNP[i]);
+			} // end while (!ewl[i].getCompleted())
+			if ( prev!=null && !prev.equals(new HashSet<IntArray>(ewlNP[0].getAnswer())) ) {
+				String blah="Error calculating "+alg.getName()+", type EWLNP ("+(i+1)+"): Result mismatch.";
+				System.err.println(blah);
+				out.close();
+				throw new IncorrectAnswerException(blah);
+			} // end if ( prev!=null && !prev.equals(new HashSet<IntArray>(parallel[0].getAnswer())) )
+			out.write(ans+"\n");
+		} // end for 0 <= i < ewl.length/**/
+		out.close();
+	} // end subalgebraTiming(Algebra,List<IntArray>,File)
+
+	/**
+	 * Represents a pair.
+	 * @author Jonah Horowitz
+	 *
+	 * @param <A>  The class of the first element
+	 * @param <B>  The class of the second element
+	 */
+	private static class Pair<A,B> {
+		private A first;
+		private B second;
+		
+		public Pair(A a, B b) {
+			first=a;
+			second=b;
+		} // end constructor(A,B)
+		
+		public A getFirst() { return first; }
+		public B getSecond() { return second; }
+	} // end class Pair<A,B>
+	
+	public static Pair<SmallAlgebra,String> loadBuiltin(String name) {
+		String fileName = "algebras/" + name + ".ua";
+		ClassLoader cl = Horowitz.class.getClassLoader();
+		InputStream is = cl.getResourceAsStream(fileName);
 		SmallAlgebra alg = null;
+		try {
+			alg = AlgebraIO.readAlgebraFromStream(is);
+		} catch ( BadAlgebraFileException e ) {
+			e.printStackTrace();
+		} catch ( IOException f ) {
+			f.printStackTrace();
+		} // end try-catch BadAlgebraFileException IOException
+		return new Pair<SmallAlgebra,String>(alg,name);
+	} // end loadBuiltin(String)
+	
+	/**
+	 * Loads all the algebras which are by default in the resources\algebras directory
+	 * @return  A list consisting of algebra, filename pairs.
+	 */
+	public static List<Pair<SmallAlgebra,String>> loadAllAlgebras() {
+		List<Pair<SmallAlgebra,String>> ans = new ArrayList<Pair<SmallAlgebra,String>>();
+/*			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\ba2.ua"),"ba2"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\baker2.ua"),"baker2"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\baker2withtop.ua"),"baker2withtop"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\cyclic2.ua"),"cyclic2"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\cyclic3.ua"),"cyclic3"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\d16.ua"),"d16"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\diffi.ua"),"diffi"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\hajilarov.ua"),"hajilarov"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\lat2-01.ua"),"lat2-01"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\lat2.ua"),"lat2"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\lyndon.ua"),"lyndon"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\m3.ua"),"m3"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\m4.ua"),"m4"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\n5.ua"),"n5"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\polin.ua"),"polin"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\sym3.ua"),"sym3"));
+			ans.add(new Pair<SmallAlgebra,String>(AlgebraIO.readAlgebraFile("resources\\algebras\\z3.ua"),"z3"));/**/			
+		ans.add(loadBuiltin("ba2"));
+		ans.add(loadBuiltin("baker2"));
+		ans.add(loadBuiltin("baker2withtop"));
+		ans.add(loadBuiltin("cyclic2"));
+		ans.add(loadBuiltin("cyclic3"));
+//		ans.add(loadBuiltin("d16"));
+		ans.add(loadBuiltin("diffi"));
+		ans.add(loadBuiltin("hajilarov"));
+		ans.add(loadBuiltin("lat2-01"));
+		ans.add(loadBuiltin("lat2"));
+		ans.add(loadBuiltin("lyndon"));
+		ans.add(loadBuiltin("m3"));
+		ans.add(loadBuiltin("m4"));
+		ans.add(loadBuiltin("n5"));
+		ans.add(loadBuiltin("polin"));
+//		ans.add(loadBuiltin("sym3"));
+		ans.add(loadBuiltin("z3"));
+		return ans;
+	} // end loadAllAlgebras()
+
+	public static void runJonssonTimeTrials() {
+		final String outD = "timeTrials-Jonsson";
+		long startTime = System.currentTimeMillis();
+		File outDir = new File(outD);
+		if (!outDir.exists()) outDir.mkdir();
+		List<Pair<SmallAlgebra,String>> algs = loadAllAlgebras();
+		List<IntArray> gens = new ArrayList<IntArray>(3);
+		gens.add(new IntArray(new int[] {0,0,1}));
+		gens.add(new IntArray(new int[] {0,1,0}));
+		gens.add(new IntArray(new int[] {1,0,0}));
+		String wasError=null;
+		for ( Pair<SmallAlgebra,String> p : algs ) {
+			File output = new File(outD+"\\"+p.getSecond()+".csv");
+			FreeAlgebra f2 = new FreeAlgebra(p.getFirst(),2);
+			f2.makeOperationTables();
+			BigProductAlgebra bpa = new BigProductAlgebra("f("+p.getSecond()+")",f2,3);
+			try {
+				subalgebraTiming(bpa,gens,true,output);
+			} catch ( IOException e ) {
+				e.printStackTrace();
+			} catch ( IncorrectAnswerException f ) {
+				wasError=f.getMessage();
+			} // end try-catch IOException IncorrectAnswerException
+		} // end for ( Pair<SmallAlgebra,String> p : algs )
+/*		for ( int i = 0; i < algs.size(); i++ ) {
+			for ( int j = i; j < algs.size(); j++ ) {
+			} // end for i <= j < algs.size()
+		} // end for 0 <= i < algs.size()/**/
+		File logFile = new File(outD+"\\logfile.txt");
+		try {
+			if (!logFile.exists()) logFile.createNewFile();
+			BufferedWriter outLog = new BufferedWriter(new FileWriter(logFile));
+			if (wasError!=null) outLog.write(wasError+"\n");
+			outLog.write("Total time taken: "+(System.currentTimeMillis()-startTime));
+			outLog.close();
+		} catch ( IOException e ) {
+			e.printStackTrace();
+		} // end try-catch IOException
+	} // end runTimeTrials()
+	
+	public static void main(String[] args) {
+		runJonssonTimeTrials();
+		
+/*		SmallAlgebra ba2 = null;
+		try {
+			ba2 = AlgebraIO.readAlgebraFile("resources\\algebras\\ba2.ua");
+		} catch ( BadAlgebraFileException e ) {
+			e.printStackTrace();
+		} catch ( IOException f ) {
+			f.printStackTrace();
+		} // end try-catch BadAlgebraFileException IOException
+		FreeAlgebra f2 = new FreeAlgebra(ba2,2);
+		f2.makeOperationTables();
+		BigProductAlgebra bpa = new BigProductAlgebra("f(ba2)",f2,3);
+		List<IntArray> gens = new ArrayList<IntArray>(3);
+		gens.add(new IntArray(new int[] {0,0,1}));
+		gens.add(new IntArray(new int[] {0,1,0}));
+		gens.add(new IntArray(new int[] {1,0,0}));
+		
+		Closer2 serial = new Closer2(bpa,gens,true).setPassDecisionProcedure(Closer2.SERIAL).setStopEachPass(true);
+		Closer2 serialNP = new Closer2(bpa,gens,true).setPassDecisionProcedure(Closer2.SERIAL).setStopEachPass(true).setForceNonPower(true);
+		while (!serial.getCompleted() && !serialNP.getCompleted()) {
+			serialNP.sgClose();
+			serial.sgClose();
+			System.out.println("Sizes: "+serial.getAnswer().size()+" -- "+serialNP.getAnswer().size());
+		} // end while (!serial.getCompleted() && !serialNP.getCompleted())/**/
+		
+/*		SmallAlgebra alg = null;
 		try {
 			alg = AlgebraIO.readAlgebraFile("resources\\algebras\\n5.ua");
 		} catch ( BadAlgebraFileException e ) {
@@ -764,7 +1042,24 @@ public class Horowitz {
 		} catch ( IOException f ) {
 			f.printStackTrace();
 		} // end try-catch BadAlgebraFileException, IOException
-		if ( alg!=null ) System.out.println("Result: "+check3GeneratedSubalgebras(alg,1));
+		File output = new File("C:\\Users\\Yiab\\Desktop\\ua\\n5p5v1.csv");
+		BigProductAlgebra bpa = new BigProductAlgebra("n5^5",alg,5);
+		List<IntArray> gens = new ArrayList<IntArray>();
+		gens.add(new IntArray(new int[] {1,0,0,0,0}));
+		gens.add(new IntArray(new int[] {0,1,0,0,0}));
+		gens.add(new IntArray(new int[] {0,0,1,0,0}));
+		gens.add(new IntArray(new int[] {0,0,0,1,0}));
+		gens.add(new IntArray(new int[] {0,0,0,0,1}));/**/
+/*		Closer2 ewl = new Closer2(bpa,gens,true).setPassDecisionProcedure(Closer2.EQUAL_WORKLOAD).setNumThreads(1).setStopEachPass(true);
+		while (!ewl.getCompleted()) {
+			System.out.println("Pass "+ewl.getPass()+", time: "+calculateCloserTiming(ewl));			
+		} // end while (!ewl.getCompleted())/**/
+/*		try {
+			subalgebraTiming(bpa,gens,true,output);
+		} catch ( IOException e ) {
+			e.printStackTrace();
+		}/**/
+//		if ( alg!=null ) System.out.println("Result: "+check3GeneratedSubalgebras(alg,1));/**/
 		
 //		(new Horowitz()).runCLI();
 /*		Vector<Operation> ops = new Vector();

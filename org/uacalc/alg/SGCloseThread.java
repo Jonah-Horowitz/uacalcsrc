@@ -5,6 +5,7 @@ import org.uacalc.util.*;
 import org.uacalc.terms.*;
 import org.uacalc.alg.op.*;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.locks.ReentrantLock;
 import org.uacalc.eq.*;
 
 /**
@@ -12,13 +13,15 @@ import org.uacalc.eq.*;
  * @author Jonah Horowitz
  */
 public class SGCloseThread extends SGClosePowerThread {
+	private List<ReentrantLock> opLocks = null;
 	
 	public SGCloseThread(BlockingQueue<SGClosePowerChunk> newFeeder, int[][] newOpTables, int[] newArities, int newArgumentsPerChunk, 
 			int newClosedMark, int newCurrentMark, List<int[]> newRawList, List<Operation> newOps, HashMap<IntArray,Term> newPrevTermMap, 
 			OperationSymbol[] newSymbols, BlockingQueue<SGClosePowerResult> newCollector, int newThreadNumber, int[][] newImgOpTables, 
-			HashMap<IntArray,Integer> newPrevHomomorphism, int newImgAlgSize) {
+			HashMap<IntArray,Integer> newPrevHomomorphism, int newImgAlgSize, List<ReentrantLock> newOpLocks) {
 		super(newFeeder,1,newOpTables,-1,newArities,newArgumentsPerChunk,newClosedMark,newCurrentMark,newRawList,newOps,newPrevTermMap,newSymbols,newCollector,newThreadNumber, newImgOpTables, newPrevHomomorphism, newImgAlgSize);
-	} // end constructor(BlockingQueue<SGClosePowerChunk>, int, int, int, List<int[]>, List<Operation>, HashMap<IntArray,Term>, BlockingQueue<HashMap<IntArray,Term>>, int) 
+		opLocks = newOpLocks;
+	} // end constructor(BlockingQueue<SGClosePowerChunk>, int, int, int, List<int[]>, List<Operation>, HashMap<IntArray,Term>, BlockingQueue<HashMap<IntArray,Term>>, int, List<ReentrantLock>) 
 	
 	@Override
 	public void run() {
@@ -32,6 +35,7 @@ public class SGCloseThread extends SGClosePowerThread {
 		Operation f = null;
 		HashMap<IntArray,Integer> morphism = null;
 		Equation failingEquation = null;
+		ReentrantLock opLock = null;
 		while (true) {
 			if (this.isInterrupted()) {
 				setStatus(SAFE_STOP);
@@ -42,6 +46,7 @@ public class SGCloseThread extends SGClosePowerThread {
 				if (tempChunk!=null) {
 					if (tempChunk==STOP_COMMAND) break;
 					f=ops.get(tempChunk.opIndex);
+					opLock=opLocks.get(tempChunk.opIndex);
 					arity=f.arity();
 					finalSegment=new int[indicesPerChunk];
 					su = new HashSet<IntArray>();
@@ -57,6 +62,7 @@ public class SGCloseThread extends SGClosePowerThread {
 					} // end if-else (hasOverMin(tempChunk.initialSegment,closedMark))
 				} else {
 					f=null;
+					opLock=null;
 					arity=-1;
 					finalSegment=null;
 					inc=null;
@@ -74,7 +80,9 @@ public class SGCloseThread extends SGClosePowerThread {
 				int[] argIndices = concatenateIntArrays(tempChunk.initialSegment,finalSegment);
 				int[][] arg = new int[arity][];
 				for ( int i = 0; i < arity; i++ ) arg[i]=rawList.get(argIndices[i]);
+				opLock.lock();
 				int[] vRaw = f.valueAt(arg);
+				opLock.unlock();
 				IntArray v = new IntArray(vRaw);
 				if ( !prevTermMap.containsKey(v) && su.add(v) ) {
 					List<Term> children = new ArrayList<Term>(arity);
